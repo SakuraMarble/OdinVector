@@ -237,7 +237,8 @@ namespace pipeann {
     // create cached vamana readers
     std::vector<cached_ifstream> vamana_readers(nshards);
     for (_u64 i = 0; i < nshards; i++) {
-      vamana_readers[i].open(vamana_names[i], 1024 * 1048576);
+      // vamana_readers[i].open(vamana_names[i], 1024 * 1048576);
+      vamana_readers[i].open(vamana_names[i], 64 * 1024 * 1024); //changecode
       size_t expected_file_size;
       vamana_readers[i].read((char *) &expected_file_size, sizeof(uint64_t));
     }
@@ -245,7 +246,8 @@ namespace pipeann {
     size_t merged_index_size = 24;
     size_t merged_index_frozen = 0;
     // create cached vamana writers
-    cached_ofstream diskann_writer(output_vamana, 1024 * 1048576);
+    // cached_ofstream diskann_writer(output_vamana, 1024 * 1048576);
+    cached_ofstream diskann_writer(output_vamana, 64 * 1024 * 1024); //changecode
     diskann_writer.write((char *) &merged_index_size, sizeof(uint64_t));
 
     unsigned output_width = max_degree;

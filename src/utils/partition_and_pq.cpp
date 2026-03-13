@@ -91,27 +91,33 @@ void gen_random_slice(const std::string data_file, double p_val, std::unique_ptr
   gen_random_slice<T>(data_file, p_val, sampled_ptr, slice_size, ndims);
   sampled_data.reset(sampled_ptr);
 }
+// changecode 尝试解决5GB底座内存的问题
 template<typename T>
-void gen_random_slice(const std::string data_file, double p_val, float *&sampled_data, size_t &slice_size,
-                      size_t &ndims) {
+void gen_random_slice(const std::string data_file, double p_val, float *&sampled_data, size_t &slice_size, size_t &ndims) {
   size_t npts;
   uint32_t npts32, ndims32;
-  std::vector<std::vector<float>> sampled_vectors;
 
-  // amount to read in one shot
   _u64 read_blk_size = 64 * 1024 * 1024;
-  std::ifstream base_reader(data_file.c_str());
+  std::ifstream base_reader(data_file.c_str(), std::ios::binary);
 
-  // metadata: npts, ndims
   base_reader.read((char *) &npts32, sizeof(unsigned));
   base_reader.read((char *) &ndims32, sizeof(unsigned));
   npts = npts32;
   ndims = ndims32;
 
-  std::unique_ptr<T[]> cur_vector_T = std::make_unique<T[]>(ndims);
   p_val = p_val < 1 ? p_val : 1;
 
-  std::random_device rd;  // Will be used to obtain a seed for the random number
+  // 1. 预估总采样量，加 5% 余量
+  size_t expected_samples = (size_t)(npts * p_val * 1.05);
+  if (expected_samples > npts) expected_samples = npts;
+  
+  // 2. 核心：发起唯一的一次大内存分配！绕过碎片池！
+  sampled_data = new float[expected_samples * ndims];
+  size_t actual_samples = 0;
+
+  std::unique_ptr<T[]> cur_vector_T = std::make_unique<T[]>(ndims);
+  
+  std::random_device rd;  
   size_t x = rd();
   std::mt19937 generator((unsigned) x);
   std::uniform_real_distribution<float> distribution(0, 1);
@@ -119,28 +125,38 @@ void gen_random_slice(const std::string data_file, double p_val, float *&sampled
   for (size_t i = 0; i < npts; i++) {
     float rnd_val = distribution(generator);
     if (rnd_val < (float) p_val) {
-      base_reader.read((char *) cur_vector_T.get(), ndims * sizeof(T));
-      std::vector<float> cur_vector_float;
-      for (size_t d = 0; d < ndims; d++)
-        cur_vector_float.push_back(cur_vector_T[d]);
-      sampled_vectors.push_back(cur_vector_float);
-    } else {
-      base_reader.seekg(ndims * sizeof(T), base_reader.cur);  // skip this vector
-    }
-  }
-  slice_size = sampled_vectors.size();
-  if (slice_size == 0) {
-    slice_size = 1;
-    std::vector<float> cur_vector_float(cur_vector_T.get(), cur_vector_T.get() + ndims);
-    sampled_vectors.push_back(cur_vector_float);
-  }
-  sampled_data = new float[slice_size * ndims];
+      if (actual_samples >= expected_samples) {
+        size_t new_expected = expected_samples * 1.2; 
+        float *new_data = new float[new_expected * ndims];
+        std::memcpy(new_data, sampled_data, actual_samples * ndims * sizeof(float));
+        delete[] sampled_data;
+        sampled_data = new_data;
+        expected_samples = new_expected;
+      }
 
-  for (size_t i = 0; i < slice_size; i++) {
-    for (size_t j = 0; j < ndims; j++) {
-      sampled_data[i * ndims + j] = sampled_vectors[i][j];
+      base_reader.read((char *) cur_vector_T.get(), ndims * sizeof(T));
+      
+      // 3. 直接拷贝进扁平数组
+      float* current_row = sampled_data + (actual_samples * ndims);
+      for (size_t d = 0; d < ndims; d++) {
+        current_row[d] = (float)cur_vector_T[d];
+      }
+      actual_samples++;
+    } else {
+      base_reader.seekg(ndims * sizeof(T), base_reader.cur);
     }
   }
+
+  if (actual_samples == 0) {
+    actual_samples = 1;
+    base_reader.seekg(2 * sizeof(unsigned), std::ios::beg);
+    base_reader.read((char *) cur_vector_T.get(), ndims * sizeof(T));
+    for (size_t d = 0; d < ndims; d++) {
+      sampled_data[d] = (float)cur_vector_T[d];
+    }
+  }
+
+  slice_size = actual_samples;
 }
 
 // given training data in train_data of dimensions num_train * dim, generate PQ
@@ -503,44 +519,37 @@ int generate_pq_data_from_pivots(const std::string data_file, unsigned num_cente
   return 0;
 }
 
+// changecode change
 template<typename T>
-int estimate_cluster_sizes(const std::string data_file, float *pivots, const size_t num_centers, const size_t dim,
+int estimate_cluster_sizes(float *eval_data_float, const size_t num_eval, const double sampling_rate,
+                           float *pivots, const size_t num_centers, const size_t dim,
                            const size_t k_base, std::vector<size_t> &cluster_sizes) {
+  // 1. 清空原有的 size 记录
   cluster_sizes.clear();
 
-  size_t num_test, test_dim;
-  float *test_data_float;
-  double sampling_rate = 0.01;
-
-  gen_random_slice<T>(data_file, sampling_rate, test_data_float, num_test, test_dim);
-
-  if (test_dim != dim) {
-    LOG(INFO) << "Error. dimensions dont match for pivot set and base set";
-    return -1;
-  }
-
+  // 2. 初始化各个分片的计数器
   size_t *shard_counts = new size_t[num_centers];
-
   for (size_t i = 0; i < num_centers; i++) {
     shard_counts[i] = 0;
   }
 
-  size_t BLOCK_SIZE = (std::min)((size_t) MAX_BLOCK_SIZE, num_test);
-  size_t num_points = 0, num_dim = 0;
-  pipeann::get_bin_metadata(data_file, num_points, num_dim);
-  size_t block_size = num_points <= BLOCK_SIZE ? num_points : BLOCK_SIZE;
+  // 3. 分块处理内存中的评估数据，防止 k_base 较大时 block_closest_centers 占用过多内存
+  size_t BLOCK_SIZE = (std::min)((size_t) MAX_BLOCK_SIZE, num_eval);
+  size_t block_size = num_eval <= BLOCK_SIZE ? num_eval : BLOCK_SIZE;
   _u32 *block_closest_centers = new _u32[block_size * k_base];
   float *block_data_float;
 
-  size_t num_blocks = DIV_ROUND_UP(num_test, block_size);
+  size_t num_blocks = DIV_ROUND_UP(num_eval, block_size);
 
   for (size_t block = 0; block < num_blocks; block++) {
     size_t start_id = block * block_size;
-    size_t end_id = (std::min)((block + 1) * block_size, num_test);
+    size_t end_id = (std::min)((block + 1) * block_size, num_eval);
     size_t cur_blk_size = end_id - start_id;
 
-    block_data_float = test_data_float + start_id * test_dim;
+    // 直接复用内存中的数据指针偏移
+    block_data_float = eval_data_float + start_id * dim;
 
+    // 计算这批样本离哪个中心点最近
     math_utils::compute_closest_centers(block_data_float, cur_blk_size, dim, pivots, num_centers, k_base,
                                         block_closest_centers);
 
@@ -552,24 +561,27 @@ int estimate_cluster_sizes(const std::string data_file, float *pivots, const siz
     }
   }
 
-  LOG(INFO) << "Estimated cluster sizes: ";
+  // 4. 根据统一的 sampling_rate 放大统计结果，估算全量数据在各分片的分布
+  LOG(INFO) << "Estimated cluster sizes (based on training set sample): ";
   for (size_t i = 0; i < num_centers; i++) {
     _u32 cur_shard_count = (_u32) shard_counts[i];
+    // 使用传入的安全采样率反推真实规模
     cluster_sizes.push_back(size_t(((double) cur_shard_count) * (1.0 / sampling_rate)));
-    std::cerr << cur_shard_count * (1.0 / sampling_rate) << " ";
+    std::cerr << size_t(((double) cur_shard_count) * (1.0 / sampling_rate)) << " ";
   }
   std::cerr << "\n";
+  
   delete[] shard_counts;
   delete[] block_closest_centers;
   return 0;
 }
 
+// changecode
 template<typename T>
 int shard_data_into_clusters(const std::string data_file, float *pivots, const size_t num_centers, const size_t dim,
                              const size_t k_base, std::string prefix_path) {
   _u64 read_blk_size = 64 * 1024 * 1024;
-  //  _u64 write_blk_size = 64 * 1024 * 1024;
-  // create cached reader + writer
+  // create cached reader
   cached_ifstream base_reader(data_file, read_blk_size);
   _u32 npts32;
   _u32 basedim32;
@@ -587,16 +599,29 @@ int shard_data_into_clusters(const std::string data_file, float *pivots, const s
   _u32 dummy_size = 0;
   _u32 const_one = 1;
 
+  // 1. 初始化写入缓冲区 (Write Buffers)
+  // 设定每个分片的缓冲区大小约为 1MB ~ 2MB 左右，防止 num_centers 很大时内存溢出
+  const size_t BUFFER_POINTS = (1024 * 1024) / (dim * sizeof(T)); 
+  size_t points_per_buffer = BUFFER_POINTS > 0 ? BUFFER_POINTS : 1024;
+
+  std::vector<std::vector<T>> data_buffers(num_centers);
+  std::vector<std::vector<uint32_t>> idmap_buffers(num_centers);
+
   for (size_t i = 0; i < num_centers; i++) {
     std::string data_filename = prefix_path + "_subshard-" + std::to_string(i) + ".bin";
     std::string idmap_filename = prefix_path + "_subshard-" + std::to_string(i) + "_ids_uint32.bin";
     shard_data_writer[i] = std::ofstream(data_filename.c_str(), std::ios::binary);
     shard_idmap_writer[i] = std::ofstream(idmap_filename.c_str(), std::ios::binary);
+    
     shard_data_writer[i].write((char *) &dummy_size, sizeof(uint32_t));
     shard_data_writer[i].write((char *) &basedim32, sizeof(uint32_t));
     shard_idmap_writer[i].write((char *) &dummy_size, sizeof(uint32_t));
     shard_idmap_writer[i].write((char *) &const_one, sizeof(uint32_t));
     shard_counts[i] = 0;
+
+    // 预分配缓冲区容量，避免在频繁推入数据时发生 std::vector 扩容导致的内存重分配
+    data_buffers[i].reserve(points_per_buffer * dim);
+    idmap_buffers[i].reserve(points_per_buffer);
   }
 
   size_t BLOCK_SIZE = (std::min)((size_t) MAX_BLOCK_SIZE, num_points);
@@ -622,10 +647,34 @@ int shard_data_into_clusters(const std::string data_file, float *pivots, const s
       for (size_t p1 = 0; p1 < k_base; p1++) {
         size_t shard_id = block_closest_centers[p * k_base + p1];
         uint32_t original_point_map_id = (uint32_t) (start_id + p);
-        shard_data_writer[shard_id].write((char *) (block_data_T.get() + p * dim), sizeof(T) * dim);
-        shard_idmap_writer[shard_id].write((char *) &original_point_map_id, sizeof(uint32_t));
+
+        // 2. 将数据追加到对应分片的内存缓冲区，而不是立即调用系统的 write()
+        T* current_point_data = block_data_T.get() + p * dim;
+        data_buffers[shard_id].insert(data_buffers[shard_id].end(), current_point_data, current_point_data + dim);
+        idmap_buffers[shard_id].push_back(original_point_map_id);
         shard_counts[shard_id]++;
+
+        // 3. 检查当前分片的缓冲区是否达到了阈值
+        if (idmap_buffers[shard_id].size() >= points_per_buffer) {
+          // 只有积攒够了一定规模（如 1MB 数据），才发起一次大块写盘
+          shard_data_writer[shard_id].write((char *) data_buffers[shard_id].data(), data_buffers[shard_id].size() * sizeof(T));
+          shard_idmap_writer[shard_id].write((char *) idmap_buffers[shard_id].data(), idmap_buffers[shard_id].size() * sizeof(uint32_t));
+          
+          // 清空缓冲区计数，但保留通过 reserve 申请的底层容量（避免内存碎片）
+          data_buffers[shard_id].clear();
+          idmap_buffers[shard_id].clear();
+        }
       }
+    }
+  }
+
+  // 4. 收尾工作：将所有分片中尚未达到阈值的剩余缓冲区数据强制写盘
+  for (size_t i = 0; i < num_centers; i++) {
+    if (!idmap_buffers[i].empty()) {
+      shard_data_writer[i].write((char *) data_buffers[i].data(), data_buffers[i].size() * sizeof(T));
+      shard_idmap_writer[i].write((char *) idmap_buffers[i].data(), idmap_buffers[i].size() * sizeof(uint32_t));
+      data_buffers[i].clear();
+      idmap_buffers[i].clear();
     }
   }
 
@@ -635,9 +684,12 @@ int shard_data_into_clusters(const std::string data_file, float *pivots, const s
     _u32 cur_shard_count = (_u32) shard_counts[i];
     total_count += cur_shard_count;
     LOG(INFO) << cur_shard_count << " ";
+    
+    // 更新元数据
     shard_data_writer[i].seekp(0);
     shard_data_writer[i].write((char *) &cur_shard_count, sizeof(uint32_t));
     shard_data_writer[i].close();
+    
     shard_idmap_writer[i].seekp(0);
     shard_idmap_writer[i].write((char *) &cur_shard_count, sizeof(uint32_t));
     shard_idmap_writer[i].close();
@@ -648,6 +700,7 @@ int shard_data_into_clusters(const std::string data_file, float *pivots, const s
   return 0;
 }
 
+// changecode change
 template<typename T>
 int partition_with_ram_budget(const std::string data_file, const double sampling_rate, double ram_budget,
                               size_t graph_degree, const std::string prefix_path, size_t k_base) {
@@ -659,46 +712,44 @@ int partition_with_ram_budget(const std::string data_file, const double sampling
   int num_parts = 3;
   bool fit_in_ram = false;
 
+  // 1. 读取并抽取数据 (已被之前的熔断机制保护，极其安全)
+  LOG(INFO) << "Loading training data with sampling rate: " << sampling_rate;
   gen_random_slice<T>(data_file, sampling_rate, train_data_float, num_train, train_dim);
 
   float *pivot_data = nullptr;
 
   std::string cur_file = std::string(prefix_path);
-  std::string output_file;
+  std::string output_file = cur_file + "_centroids.bin";
 
-  // kmeans_partitioning on training data
-
-  //  cur_file = cur_file + "_kmeans_partitioning-" + std::to_string(num_parts);
-  output_file = cur_file + "_centroids.bin";
-
+  // 2. 循环寻找最合适的分片数量
   while (!fit_in_ram) {
     fit_in_ram = true;
-
     double max_ram_usage = 0;
+    
     if (pivot_data != nullptr)
       delete[] pivot_data;
 
     pivot_data = new float[num_parts * train_dim];
-    // Process Global k-means for kmeans_partitioning Step
-    LOG(INFO) << "Processing global k-means (kmeans_partitioning Step)";
+    
+    // Process Global k-means
+    LOG(INFO) << "Processing global k-means with " << num_parts << " partitions...";
     kmeans::kmeanspp_selecting_pivots(train_data_float, num_train, train_dim, pivot_data, num_parts);
-
     kmeans::run_lloyds(train_data_float, num_train, train_dim, pivot_data, num_parts, max_k_means_reps, NULL, NULL);
 
-    // now pivots are ready. need to stream base points and assign them to
-    // closest clusters.
-
     std::vector<size_t> cluster_sizes;
-    estimate_cluster_sizes<T>(data_file, pivot_data, num_parts, train_dim, k_base, cluster_sizes);
+    
+    // 【重要优化】：直接将内存中的 train_data_float 传给评估函数！零 I/O！
+    estimate_cluster_sizes<T>(train_data_float, num_train, sampling_rate, pivot_data, num_parts, train_dim, k_base, cluster_sizes);
 
     for (auto &p : cluster_sizes) {
       double cur_shard_ram_estimate = pipeann::estimate_ram_usage(p, train_dim, sizeof(T), graph_degree);
-
       if (cur_shard_ram_estimate > max_ram_usage)
         max_ram_usage = cur_shard_ram_estimate;
     }
+    
     LOG(INFO) << "With " << num_parts << " parts, max estimated RAM usage: " << max_ram_usage / (1024 * 1024 * 1024)
-              << "GB, budget given is " << ram_budget;
+              << "GB, budget given is " << ram_budget << "GB";
+              
     if (max_ram_usage > 1024 * 1024 * 1024 * ram_budget) {
       fit_in_ram = false;
       num_parts++;
@@ -708,9 +759,19 @@ int partition_with_ram_budget(const std::string data_file, const double sampling
   LOG(INFO) << "Saving global k-center pivots";
   pipeann::save_bin<float>(output_file.c_str(), pivot_data, (size_t) num_parts, train_dim);
 
-  shard_data_into_clusters<T>(data_file, pivot_data, num_parts, train_dim, k_base, prefix_path);
-  delete[] pivot_data;
+  // 3. 【过河拆桥】：在进入高压 I/O 落盘阶段前，彻底释放内存中的训练集！
+  LOG(INFO) << "Freeing training data memory before sharding I/O...";
   delete[] train_data_float;
+  train_data_float = nullptr;
+
+  // 4. 带着极低的内存占用，开始将全量数据划分为子分片
+  shard_data_into_clusters<T>(data_file, pivot_data, num_parts, train_dim, k_base, prefix_path);
+  
+  // 5. 收尾清理
+  if (pivot_data != nullptr) {
+    delete[] pivot_data;
+  }
+  
   return num_parts;
 }
 
