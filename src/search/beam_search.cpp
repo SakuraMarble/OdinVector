@@ -4,6 +4,7 @@
 #include <malloc.h>
 #include <algorithm>
 #include <filesystem>
+#include <queue>
 
 #include <omp.h>
 #include <chrono>
@@ -307,3 +308,259 @@ namespace pipeann {
   template class SSDIndex<_s8>;
   template class SSDIndex<_u8>;
 }  // namespace pipeann
+
+namespace pipeann {
+
+  template<typename T, typename TagT>
+  size_t SSDIndex<T, TagT>::filter_beam_search(const T *query1, const _u64 k_search, const _u32 mem_L, const _u64 l_search,
+                                               TagT *res_tags, float *distances, const _u64 beam_width,
+                                               const std::vector<uint32_t> &candidate_ids, QueryStats *stats) {
+    if (candidate_ids.empty()) {
+      std::cout << "[DEBUG] candidate_ids is empty, returning early." << std::endl;
+      for (uint64_t i = 0; i < k_search; i++) {
+        res_tags[i] = 0;
+        distances[i] = std::numeric_limits<float>::max();
+      }
+      return 0;
+    }
+
+    std::shared_lock lk(merge_lock);
+    auto diskSearchBegin = std::chrono::high_resolution_clock::now();
+
+    auto query_buf = pop_query_buf(query1);
+    void *ctx = reader->get_ctx();
+    const T *query = query_buf->aligned_query_T;
+    query_buf->reset();
+
+    // Data buffers
+    T *data_buf = query_buf->coord_scratch;
+    _u64 &data_buf_idx = query_buf->coord_idx;
+    char *sector_scratch = query_buf->sector_scratch;
+    _u64 &sector_scratch_idx = query_buf->sector_idx;
+
+    // PQ Setup
+    float *pq_dists = query_buf->aligned_pqtable_dist_scratch;
+    pq_table.populate_chunk_distances(query, pq_dists);
+    float *dist_scratch = query_buf->aligned_dist_scratch;
+    _u8 *pq_coord_scratch = query_buf->aligned_pq_coord_scratch;
+
+    auto compute_dists = [this, pq_coord_scratch, pq_dists](const unsigned *ids, const _u64 n_ids, float *dists_out) {
+      ::aggregate_coords(ids, n_ids, this->data.data(), this->n_chunks, pq_coord_scratch);
+      ::pq_dist_lookup(pq_coord_scratch, n_ids, this->n_chunks, pq_dists, dists_out);
+    };
+
+    Timer query_timer, io_timer, cpu_timer;
+    
+    // search_ctx: Navigation pool (bounded by l_search)
+    std::vector<Neighbor> retset;
+    retset.resize(mem_L + 10 * l_search);
+    unsigned cur_list_size = 0;
+
+    // result_heap: Max-heap for collecting valid filtered results
+    std::priority_queue<Neighbor> result_heap; 
+    
+    tsl::robin_set<_u64> visited(4096);
+    _u32 best_medoid = medoids[0];
+
+    // Initialize entry points
+    auto compute_and_add_to_retset = [&](const unsigned *node_ids, const _u64 n_ids) {
+      compute_dists(node_ids, n_ids, dist_scratch);
+      for (_u64 i = 0; i < n_ids; ++i) {
+        unsigned id = node_ids[i];
+        float dist = dist_scratch[i];
+        
+        // Initial Entry: Branch A (Check labels for result_heap)
+        uint32_t tag = id2tag(id);
+        if (std::binary_search(candidate_ids.begin(), candidate_ids.end(), tag)) {
+          if (result_heap.size() < k_search) {
+            result_heap.push(Neighbor(id, dist, true));
+          } else if (dist < result_heap.top().distance) {
+            result_heap.pop();
+            result_heap.push(Neighbor(id, dist, true));
+          }
+        }
+
+        // Initial Entry: Branch B (Always add to navigation retset)
+        retset[cur_list_size].id = id;
+        retset[cur_list_size].distance = dist;
+        retset[cur_list_size++].flag = true;
+        visited.insert(id);
+      }
+    };
+
+    // PipeANN requires using mem_index or medoids since candidate_ids are external tags, not internal IDs
+    if (mem_L) {
+      std::vector<unsigned> mem_tags(mem_L);
+      std::vector<float> mem_dists(mem_L);
+      mem_index_->search_with_tags(query, mem_L, mem_L, mem_tags.data(), mem_dists.data());
+      compute_and_add_to_retset(mem_tags.data(), std::min((unsigned) mem_L, (unsigned) l_search));
+    } else {
+      compute_and_add_to_retset(&best_medoid, 1);
+    }
+
+    std::sort(retset.begin(), retset.begin() + cur_list_size);
+
+    unsigned cmps = 0;
+    unsigned hops = 0;
+    unsigned num_ios = 0;
+    unsigned k = 0;
+
+    std::vector<unsigned> frontier;
+    using fnhood_t = std::tuple<unsigned, unsigned, char *>;
+    std::vector<fnhood_t> frontier_nhoods;
+    std::vector<IORequest> frontier_read_reqs;
+    std::vector<uint64_t> page_ref{};
+
+    // Main Search Loop
+    while (k < cur_list_size) {
+      auto nk = cur_list_size;
+      frontier.clear();
+      frontier_nhoods.clear();
+      frontier_read_reqs.clear();
+      sector_scratch_idx = 0;
+
+      // Extract unexpanded nodes for the beam
+      _u32 marker = k;
+      _u32 num_seen = 0;
+      while (marker < cur_list_size && frontier.size() < beam_width && num_seen < beam_width) {
+        if (retset[marker].flag) {
+          num_seen++;
+          frontier.push_back(retset[marker].id);
+          retset[marker].flag = false;
+        }
+        marker++;
+      }
+
+      std::vector<uint32_t> locked;
+      if (!frontier.empty()) {
+        if (stats != nullptr) stats->n_hops++;
+        locked = this->lock_idx(idx_lock_table, kInvalidID, frontier, true);
+        
+        for (_u64 i = 0; i < frontier.size(); i++) {
+          uint32_t id = frontier[i];
+          uint32_t loc = this->id2loc(id);
+          uint64_t offset = loc_sector_no(loc) * SECTOR_LEN;
+          auto sector_buf = sector_scratch + sector_scratch_idx * size_per_io;
+          
+          frontier_nhoods.push_back(std::make_tuple(id, loc, sector_buf));
+          frontier_read_reqs.emplace_back(IORequest(offset, size_per_io, sector_buf, u_loc_offset(loc), max_node_len));
+          sector_scratch_idx++;
+          
+          if (stats != nullptr) { stats->n_4k++; stats->n_ios++; }
+          num_ios++;
+        }
+        
+        io_timer.reset();
+#ifdef DIRECT_READ_CC
+        reader->read(frontier_read_reqs, ctx);
+#else
+        reader->read_alloc(frontier_read_reqs, ctx, &page_ref);
+#endif
+        if (stats != nullptr) stats->io_us += (double) io_timer.elapsed();
+        this->unlock_idx(idx_lock_table, locked);
+      }
+
+      // [DEBUG] 4. 统计在这轮中，到底碰到了多少个有效的 candidate
+      _u32 candidates_found_this_hop = 0; 
+
+      // Process Neighborhoods
+      for (auto &frontier_nhood : frontier_nhoods) {
+        auto [id, loc, sector_buf] = frontier_nhood;
+        char *node_disk_buf = offset_to_loc(sector_buf, loc);
+        unsigned *node_buf = offset_to_node_nhood(node_disk_buf);
+        _u64 nnbrs = (_u64) (*node_buf);
+        unsigned *node_nbrs = (node_buf + 1);
+
+        // 【修复 1】彻底删除 node_fp_coords_copy 相关的 4 行 memcpy 和 data_buf_idx 累加代码
+
+        cpu_timer.reset();
+        compute_dists(node_nbrs, nnbrs, dist_scratch);
+        if (stats != nullptr) {
+          stats->n_cmps += (double) nnbrs;
+          stats->cpu_us += (double) cpu_timer.elapsed();
+        }
+
+        cpu_timer.reset();
+        for (_u64 m = 0; m < nnbrs; ++m) {
+          unsigned nbr_id = node_nbrs[m];
+
+          // 【修复 2】加上脏 ID 防护，防止 id2tag 数组越界崩溃
+          if (unlikely(nbr_id > this->cur_id)) {
+             continue; // 或者像 do_beam_search 那样报错
+          }
+
+          if (visited.find(nbr_id) != visited.end()) {
+            continue;
+          }
+
+          visited.insert(nbr_id);
+          cmps++;
+          float dist = dist_scratch[m];
+          if (stats != nullptr) stats->n_cmps++;
+
+          // --- Branch A: Maintain result_heap (Look at labels) ---
+          uint32_t tag = id2tag(nbr_id);
+          if (std::binary_search(candidate_ids.begin(), candidate_ids.end(), tag)) {
+            candidates_found_this_hop++; // 计数
+            if (result_heap.size() < k_search) {
+              result_heap.push(Neighbor(nbr_id, dist, true));
+            } else if (dist < result_heap.top().distance) {
+              result_heap.pop();
+              result_heap.push(Neighbor(nbr_id, dist, true));
+            }
+          }
+
+          // --- Branch B: Maintain search navigation retset (Ignore labels) ---
+          if (cur_list_size < l_search || dist < retset[cur_list_size - 1].distance) {
+            Neighbor nn(nbr_id, dist, true);
+            auto r = InsertIntoPool(retset.data(), cur_list_size, nn);
+            
+            if (cur_list_size < l_search) {
+              ++cur_list_size;
+              if (unlikely(cur_list_size >= retset.size())) {
+                retset.resize(2 * cur_list_size);
+              }
+            }
+            if (r < nk) nk = r;
+          }
+        }
+        if (stats != nullptr) stats->cpu_us += (double) cpu_timer.elapsed();
+      }
+
+      if (nk <= k) k = nk; 
+      else ++k;
+
+      hops++;
+    }
+
+    reader->deref(&page_ref, ctx);
+    push_query_buf(query_buf);
+
+    // --- Extract and Format Results ---
+    std::vector<Neighbor> final_results;
+    final_results.reserve(result_heap.size());
+    while (!result_heap.empty()) {
+      final_results.push_back(result_heap.top());
+      result_heap.pop();
+    }
+
+    // Sort ascending (priority queue pops largest first)
+    std::sort(final_results.begin(), final_results.end());
+
+    size_t result_count = std::min((size_t)k_search, final_results.size());
+    for (size_t i = 0; i < result_count; i++) {
+      res_tags[i] = id2tag(final_results[i].id);
+      distances[i] = final_results[i].distance;
+    }
+
+    // Pad remaining slots
+    for (size_t i = result_count; i < k_search; i++) {
+      res_tags[i] = 0;
+      distances[i] = std::numeric_limits<float>::max();
+    }
+
+    if (stats != nullptr) stats->total_us = (double) query_timer.elapsed();
+
+    return result_count;
+  }
+} // namespace pipeann

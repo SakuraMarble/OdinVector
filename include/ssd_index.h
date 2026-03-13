@@ -187,6 +187,10 @@ namespace pipeann {
                        float *res_dists, const _u64 beam_width, QueryStats *stats = nullptr,
                        tsl::robin_set<uint32_t> *deleted_nodes = nullptr, bool dyn_search_l = true);
 
+    size_t filter_beam_search(const T *query1, const _u64 k_search, const _u32 mem_L, const _u64 l_search,
+                              TagT *res_tags, float *distances, const _u64 beam_width,
+                              const std::vector<uint32_t> &candidate_ids, QueryStats *stats);
+
     size_t coro_search(T **queries, const _u64 k_search, const _u32 mem_L, const _u64 l_search, TagT **res_tags,
                        float **res_dists, const _u64 beam_width, int N);
 
