@@ -20,7 +20,9 @@
 
 namespace pipeann {
   inline double estimate_ram_usage(size_t size, size_t dim, size_t datasize, size_t degree) {
-    double graph_size = (double) size * (double) degree * (double) sizeof(unsigned) * SLACK_FACTOR;
+    // double graph_size = (double) size * (double) degree * (double) sizeof(unsigned) * SLACK_FACTOR;
+    // 图存储：除了邻居节点ID，还需加上std::vector对象本身的24字节开销 changecode
+    double graph_size = (double)size * ((double)degree * sizeof(unsigned) * SLACK_FACTOR + 24);
     size_t data_size = size * ROUND_UP(dim, 8) * datasize;
     return OVERHEAD_FACTOR * (graph_size + data_size);
   }
