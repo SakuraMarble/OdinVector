@@ -187,9 +187,13 @@ namespace pipeann {
                        float *res_dists, const _u64 beam_width, QueryStats *stats = nullptr,
                        tsl::robin_set<uint32_t> *deleted_nodes = nullptr, bool dyn_search_l = true);
 
-    size_t filter_beam_search(const T *query1, const _u64 k_search, const _u32 mem_L, const _u64 l_search,
-                              TagT *res_tags, float *distances, const _u64 beam_width,
-                              const std::vector<uint32_t> &candidate_ids, QueryStats *stats);
+    size_t filter_beam_search(const T *query, const _u64 k_search, const _u32 mem_L, const _u64 l_search, TagT *res_tags,
+                       float *res_dists, const _u64 beam_width, const std::vector<uint32_t>& candidate_ids, QueryStats *stats = nullptr,
+                       tsl::robin_set<uint32_t> *deleted_nodes = nullptr, bool dyn_search_l = true);
+
+    // size_t filter_beam_search(const T *query1, const _u64 k_search, const _u32 mem_L, const _u64 l_search,
+    //                           TagT *res_tags, float *distances, const _u64 beam_width,
+    //                           const std::vector<uint32_t> &candidate_ids, QueryStats *stats);
 
     size_t coro_search(T **queries, const _u64 k_search, const _u32 mem_L, const _u64 l_search, TagT **res_tags,
                        float **res_dists, const _u64 beam_width, int N);
@@ -275,6 +279,12 @@ namespace pipeann {
                         std::vector<Neighbor> &expanded_nodes_info, tsl::robin_map<uint32_t, T *> *coord_map = nullptr,
                         QueryStats *stats = nullptr, tsl::robin_set<uint32_t> *exclude_nodes = nullptr,
                         bool dyn_search_l = true, std::vector<uint64_t> *passthrough_page_ref = nullptr);
+                        
+    void do_filter_beam_search(const T *vec, uint32_t mem_L, uint32_t Lsize, const uint32_t beam_width,
+                        std::vector<Neighbor> &expanded_nodes_info, tsl::robin_set<uint32_t> *candidate_set, tsl::robin_map<uint32_t, T *> *coord_map = nullptr,
+                        QueryStats *stats = nullptr, tsl::robin_set<uint32_t> *exclude_nodes = nullptr,
+                        bool dyn_search_l = true, std::vector<uint64_t> *passthrough_page_ref = nullptr);
+
     void occlude_list(std::vector<Neighbor> &pool, const tsl::robin_map<uint32_t, T *> &coord_map,
                       std::vector<Neighbor> &result, std::vector<float> &occlude_factor);
     void prune_neighbors(const tsl::robin_map<uint32_t, T *> &coord_map, std::vector<Neighbor> &pool,

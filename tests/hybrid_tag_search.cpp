@@ -615,7 +615,7 @@ std::string recall_string = "Recall@" + std::to_string(recall_at);
                             mem_L, L,
                             result_tags.data()  + i * recall_at,
                             result_dists.data() + i * recall_at, 
-                            beamwidth, cand_ids, stats + i);
+                            beamwidth, cand_ids, stats + i, nullptr, false);
 
                         // ---------------------------------------------------------
                         // [Debug Information] 打印 Graph Path 的检索结果
