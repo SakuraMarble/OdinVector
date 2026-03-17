@@ -366,25 +366,12 @@ namespace pipeann {
     auto compute_and_add_to_retset = [&](const unsigned *node_ids, const _u64 n_ids) {
       compute_dists(node_ids, n_ids, dist_scratch);
       for (_u64 i = 0; i < n_ids; ++i) {
-        unsigned id = node_ids[i];
-        float dist = dist_scratch[i];
-        
-        // Initial Entry: Branch A (Check labels for result_heap)
-        uint32_t tag = id2tag(id);
-        if (std::binary_search(candidate_ids.begin(), candidate_ids.end(), tag)) {
-          if (result_heap.size() < k_search) {
-            result_heap.push(Neighbor(id, dist, true));
-          } else if (dist < result_heap.top().distance) {
-            result_heap.pop();
-            result_heap.push(Neighbor(id, dist, true));
-          }
-        }
-
-        // Initial Entry: Branch B (Always add to navigation retset)
-        retset[cur_list_size].id = id;
-        retset[cur_list_size].distance = dist;
+        // [修复]：不要在这里判断 candidate_ids 并加入 result_heap！
+        // 因为这些点接下来一定会被放到 frontier 里去读盘，读完盘再算精确距离。
+        retset[cur_list_size].id = node_ids[i];
+        retset[cur_list_size].distance = dist_scratch[i];
         retset[cur_list_size++].flag = true;
-        visited.insert(id);
+        visited.insert(node_ids[i]);
       }
     };
 
@@ -467,11 +454,33 @@ namespace pipeann {
       for (auto &frontier_nhood : frontier_nhoods) {
         auto [id, loc, sector_buf] = frontier_nhood;
         char *node_disk_buf = offset_to_loc(sector_buf, loc);
+
+        // ==========================================
+        // 【核心修复】：恢复节点自身的精确距离计算
+        // ==========================================
+        T *node_fp_coords = offset_to_node_coords(node_disk_buf);
+        T *node_fp_coords_copy = data_buf + (data_buf_idx * aligned_dim);
+        memcpy(node_fp_coords_copy, node_fp_coords, data_dim * sizeof(T));
+        data_buf_idx++; // 必须累加，保证 AVX 内存对齐不会互相覆盖
+        
+        float exact_dist = dist_cmp->compare(query, node_fp_coords_copy, (unsigned) aligned_dim);
+
+        // 检查过滤条件，并使用【精确距离】更新最终的结果堆
+        uint32_t tag = id2tag(id);
+        if (std::binary_search(candidate_ids.begin(), candidate_ids.end(), tag)) {
+          if (result_heap.size() < k_search) {
+            result_heap.push(Neighbor(id, exact_dist, true));
+          } else if (exact_dist < result_heap.top().distance) {
+            result_heap.pop();
+            result_heap.push(Neighbor(id, exact_dist, true));
+          }
+        }
+        // ==========================================
+
+        // 接下来处理它的邻居，仅用于图的路由寻路 (PQ距离)
         unsigned *node_buf = offset_to_node_nhood(node_disk_buf);
         _u64 nnbrs = (_u64) (*node_buf);
         unsigned *node_nbrs = (node_buf + 1);
-
-        // 【修复 1】彻底删除 node_fp_coords_copy 相关的 4 行 memcpy 和 data_buf_idx 累加代码
 
         cpu_timer.reset();
         compute_dists(node_nbrs, nnbrs, dist_scratch);
@@ -484,37 +493,17 @@ namespace pipeann {
         for (_u64 m = 0; m < nnbrs; ++m) {
           unsigned nbr_id = node_nbrs[m];
 
-          // 【修复 2】加上脏 ID 防护，防止 id2tag 数组越界崩溃
-          if (unlikely(nbr_id > this->cur_id)) {
-             continue; // 或者像 do_beam_search 那样报错
-          }
-
-          if (visited.find(nbr_id) != visited.end()) {
-            continue;
-          }
-
+          if (unlikely(nbr_id > this->cur_id)) continue;
+          if (visited.find(nbr_id) != visited.end()) continue;
           visited.insert(nbr_id);
-          cmps++;
-          float dist = dist_scratch[m];
+
+          float pq_dist = dist_scratch[m];
           if (stats != nullptr) stats->n_cmps++;
 
-          // --- Branch A: Maintain result_heap (Look at labels) ---
-          uint32_t tag = id2tag(nbr_id);
-          if (std::binary_search(candidate_ids.begin(), candidate_ids.end(), tag)) {
-            candidates_found_this_hop++; // 计数
-            if (result_heap.size() < k_search) {
-              result_heap.push(Neighbor(nbr_id, dist, true));
-            } else if (dist < result_heap.top().distance) {
-              result_heap.pop();
-              result_heap.push(Neighbor(nbr_id, dist, true));
-            }
-          }
-
-          // --- Branch B: Maintain search navigation retset (Ignore labels) ---
-          if (cur_list_size < l_search || dist < retset[cur_list_size - 1].distance) {
-            Neighbor nn(nbr_id, dist, true);
+          // Branch B: Maintain search navigation retset (仅用 PQ 距离判断是否加入路由池)
+          if (cur_list_size < l_search || pq_dist < retset[cur_list_size - 1].distance) {
+            Neighbor nn(nbr_id, pq_dist, true);
             auto r = InsertIntoPool(retset.data(), cur_list_size, nn);
-            
             if (cur_list_size < l_search) {
               ++cur_list_size;
               if (unlikely(cur_list_size >= retset.size())) {
@@ -526,7 +515,7 @@ namespace pipeann {
         }
         if (stats != nullptr) stats->cpu_us += (double) cpu_timer.elapsed();
       }
-
+      
       if (nk <= k) k = nk; 
       else ++k;
 

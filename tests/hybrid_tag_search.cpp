@@ -562,9 +562,6 @@ std::string recall_string = "Recall@" + std::to_string(recall_at);
 
             #pragma omp for schedule(dynamic, 1)
             for (int64_t i = 0; i < (int64_t)query_num; i++) {
-                // 仅对前 5 个查询打印详细日志，避免日志刷屏
-                bool debug_print = (i < 5);
-
                 try {
                     roaring::Roaring candidates = parser.parse(query_labels[i]);
                     uint64_t cand_count = candidates.cardinality();
@@ -603,8 +600,7 @@ std::string recall_string = "Recall@" + std::to_string(recall_at);
                         stats[i].total_us = std::chrono::duration<double>(q_end - q_start).count() * 1e6;
                         stats[i].n_ios    = 0;
                     } else {
-                        // === Graph path: direct filter_beam_search ===
-                        
+                        // === Graph path: direct filter_beam_search ==
                         count_graph++;
                         total_cand_graph += cand_count;
                         {
@@ -612,8 +608,7 @@ std::string recall_string = "Recall@" + std::to_string(recall_at);
                             while (cand_count > cur_max &&
                                    !max_cand_graph.compare_exchange_weak(cur_max, cand_count));
                         }
-
-
+                        
                         // 直接调用新编写的 filter_beam_search
                         index->filter_beam_search(
                             query + (i * query_dim), (uint64_t)recall_at, 
@@ -622,11 +617,43 @@ std::string recall_string = "Recall@" + std::to_string(recall_at);
                             result_dists.data() + i * recall_at, 
                             beamwidth, cand_ids, stats + i);
 
-                        // index->beam_search(query + (i * query_dim), (uint64_t) recall_at, mem_L, (uint64_t) L,
-                        //           result_tags.data() + (i * recall_at),
-                        //           result_dists.data() + (i * recall_at), (uint64_t) beamwidth, stats + i,
-                        //           nullptr, false);
-                            
+                        // ---------------------------------------------------------
+                        // [Debug Information] 打印 Graph Path 的检索结果
+                        // ---------------------------------------------------------
+                        // 只打印前 5 个走到这个分支的 query，避免控制台刷屏
+                        if (count_graph.load() <= 5) {
+                            #pragma omp critical
+                            {
+                                std::cout << "\n[Debug Graph Path] Query ID: " << i << std::endl;
+                                std::cout << "  - Hit Rate: " << hit_rate << " (" << cand_count << " / " << total_num_points << ")" << std::endl;
+                                
+                                // 1. 打印检索出的 Top-K ID
+                                std::cout << "  - Retrieved IDs: ";
+                                for (size_t j = 0; j < recall_at; j++) {
+                                    std::cout << result_tags[i * recall_at + j] << " ";
+                                }
+                                std::cout << std::endl;
+
+                                // 2. 打印 Ground Truth，并检查 GT 是否满足过滤条件
+                                if (calc_recall && gt_ids) {
+                                    std::cout << "  - GroundTruth IDs [In Candidates?]: ";
+                                    size_t hit_count = 0;
+                                    for (size_t j = 0; j < recall_at; j++) {
+                                        uint32_t gt_id = gt_ids[i * gt_dim + j];
+                                        // 检查 GT 是否在 Roaring Bitmap 中
+                                        bool in_cand = candidates.contains(gt_id);
+                                        std::cout << gt_id << (in_cand ? "[Y] " : "[N] ");
+                                        
+                                        // 顺便检查是否被成功召回
+                                        for (size_t k = 0; k < recall_at; k++) {
+                                            if (result_tags[i * recall_at + k] == gt_id) hit_count++;
+                                        }
+                                    }
+                                    std::cout << "\n  - Single Query Recall: " << hit_count << " / " << recall_at << std::endl;
+                                }
+                                std::cout << "---------------------------------------------------------" << std::endl;
+                            }
+                        }
                     }
                 } catch (const std::exception& e) {
 #pragma omp critical
