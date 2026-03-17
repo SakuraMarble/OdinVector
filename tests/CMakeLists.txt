@@ -70,4 +70,11 @@ else()
     )
     target_include_directories(build_ivf_index PRIVATE ${CROARING_INCLUDE})
     target_link_libraries(build_ivf_index ${PROJECT_NAME} ${CROARING_LIB})
+
+    add_executable(test_dynamic_ivf
+        test_dynamic_ivf.cpp
+        InvertedIndex.cpp
+    )
+    target_include_directories(test_dynamic_ivf PRIVATE ${CROARING_INCLUDE})
+    target_link_libraries(test_dynamic_ivf ${PROJECT_NAME} ${CROARING_LIB})
 endif()
