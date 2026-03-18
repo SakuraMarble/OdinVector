@@ -603,9 +603,9 @@ namespace pipeann {
     tsl::robin_set<_u64> visited(4096);
 
     // re-naming `expanded_nodes_info` to not change rest of the code
-    std::vector<Neighbor> &full_retset = expanded_nodes_info;
+    std::vector<Neighbor> &full_retset = expanded_nodes_info; // 这是最终要返回的
     full_retset.reserve(10 * l_search);
-    // std::vector<Neighbor> result_heap; // mbj: 收集满足标签的向量
+    std::priority_queue<Neighbor> result_heap; // mbj: 收集满足标签的向量
 
     _u32 best_medoid = medoids[0];
 
@@ -616,6 +616,7 @@ namespace pipeann {
         retset[cur_list_size].id = node_ids[i];
         retset[cur_list_size].distance = dist_scratch[i];
         retset[cur_list_size++].flag = true;
+        result_heap.push(Neighbor(node_ids[i], dist_scratch[i],true));
         visited.insert(node_ids[i]);
       }
     };
@@ -627,11 +628,20 @@ namespace pipeann {
       compute_and_add_to_retset(mem_tags.data(), std::min((unsigned) mem_L, (unsigned) l_search));
     } else {
       // Do not use optimized start point.
-      compute_and_add_to_retset(&best_medoid, 1); 
+      // compute_and_add_to_retset(&best_medoid, 1); 
       // mbj: 不再使用全局入口点，而是基于满足标签的向量选择入口点？如何选择？计算每个候选点与目标点的距离，然后选择前K近？
       // 这样太过缓慢，可能设计非常多次的PQ距离计算。如果临时构建一个内存图，然后快速找呢？不划算，因为候选集会一直变化，一次
       // 构建的内存索引用完就没用了。之前最简单的逻辑就是，使用前k个满足标签的向量直接作为入口点。有没有更好的idea？
       // 命中率较高时，使用全局入口点已经够用，此处不做修改。
+      // 尝试修改为前l_search个候选id作为入口点
+      std::vector<uint32_t> entry_tags; // TODO：处理tag2id
+      unsigned num_entry = std::min((unsigned) candidate_set->size(), (unsigned) 10);
+
+      auto it = candidate_set->begin();
+      for(unsigned i = 0; i < num_entry && it != candidate_set->end(); ++i, ++it) {
+        entry_tags.push_back(*it);
+      }
+      compute_and_add_to_retset(entry_tags.data(), num_entry);
     }
 
     std::sort(retset.begin(), retset.begin() + cur_list_size);
@@ -724,10 +734,10 @@ namespace pipeann {
         }
         // full_retset.push_back(Neighbor(id, cur_expanded_dist, true));
         // mbj:收集满足标签的向量，直接用full_retset的逻辑
-        uint32_t tag = id2tag(id);
-        if (candidate_set->find(tag) != candidate_set->end()) {
-          full_retset.push_back(Neighbor(id, cur_expanded_dist, true));
-        }
+        // uint32_t tag = id2tag(id);
+        // if (candidate_set->find(tag) != candidate_set->end()) {
+        //   full_retset.push_back(Neighbor(id, cur_expanded_dist, true));
+        // }
         unsigned *node_nbrs = (node_buf + 1);
 
         // compute node_nbrs <-> query dist in PQ space
@@ -755,12 +765,21 @@ namespace pipeann {
             if (stats != nullptr) {
               stats->n_cmps++;
             }
+            uint32_t tag = id2tag(id);
+            if (candidate_set->find(tag) != candidate_set->end()) {
+              if(result_heap.size() < 10) {
+                result_heap.push(Neighbor(id, dist, true));
+              } else if(dist < result_heap.top().distance) {
+                result_heap.pop();
+                result_heap.push(Neighbor(id, dist, true));
+              }
+            }
             if (dist >= retset[cur_list_size - 1].distance && (cur_list_size == l_search))
               continue;
             Neighbor nn(id, dist, true);
             // variable search_L for deleted nodes.
             // Return position in sorted list where nn inserted.
-
+            
             auto r = InsertIntoPool(retset.data(), cur_list_size, nn);
 
             if (cur_list_size < l_search) {
@@ -816,13 +835,16 @@ namespace pipeann {
           break;
       }
     }
+    while(!result_heap.empty()) {
+      full_retset.push_back(result_heap.top());
+      result_heap.pop();
+    }
     // re-sort by distance
     std::sort(full_retset.begin(), full_retset.end(),
               [](const Neighbor &left, const Neighbor &right) { return left < right; });
     // mbj: 对result_heap进行重排序
     // std::sort(result_heap.begin(), result_heap.end(),
     //           [](const Neighbor &left, const Neighbor &right) { return left < right; });
-
     if (passthrough_page_ref == nullptr) {
       reader->deref(&page_ref, ctx);
     }

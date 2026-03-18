@@ -24,7 +24,7 @@ QUERY_LABEL_FILE="/home/mabojing/datasets/sift1m/query_gt_pair_query10k_label100
 
 # --- 输出配置 ---
 # 所有生成文件存放的文件夹
-WORK_DIR="/home/mabojing/clean-workbase/search_DEBUG"
+WORK_DIR="/home/mabojing/clean-workbase/search_DEBUG_尝试1m数据集效果"
 
 # --- 搜索参数 ---
 DATA_TYPE="float"           # 向量类型：float/int8/uint8
@@ -33,9 +33,9 @@ BEAMWIDTH=4                 # Beam Search 宽度
 K=10                        # 返回 Top-K 结果
 SIMILARITY="l2"             # 距离度量：l2/cosine
 MEM_L=0                     # 内存索引 L 参数（0 = 不使用内存索引）
-HIT_RATE_THRESHOLD=0.6      # 策略切换阈值
-IVF_TOPL_MULTIPLIER=10000       # IVF 粗排扩展倍数
-SEARCH_LISTS="500"   # 搜索列表大小列表（可多个，需 ≥ K）
+HIT_RATE_THRESHOLD=0.01      # 策略切换阈值
+IVF_TOPL_MULTIPLIER=100       # IVF 粗排扩展倍数
+SEARCH_LISTS="100"   # 搜索列表大小列表（可多个，需 ≥ K）
 
 # --- 日志与监控文件 ---
 APP_LOG="${WORK_DIR}/search_process.log"       # 程序标准输出日志

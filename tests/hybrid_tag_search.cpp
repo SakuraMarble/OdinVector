@@ -606,10 +606,10 @@ std::string recall_string = "Recall@" + std::to_string(recall_at);
                         {
                             uint64_t cur_max = max_cand_graph.load();
                             while (cand_count > cur_max &&
-                                   !max_cand_graph.compare_exchange_weak(cur_max, cand_count));
+                                !max_cand_graph.compare_exchange_weak(cur_max, cand_count));
                         }
-                        
-                        // 直接调用新编写的 filter_beam_search
+
+                        // 调用 filter_beam_search
                         index->filter_beam_search(
                             query + (i * query_dim), (uint64_t)recall_at, 
                             mem_L, L,
@@ -618,41 +618,47 @@ std::string recall_string = "Recall@" + std::to_string(recall_at);
                             beamwidth, cand_ids, stats + i, nullptr, false);
 
                         // ---------------------------------------------------------
-                        // [Debug Information] 打印 Graph Path 的检索结果
+                        // [Debug Information] 增强版：打印结果、GT 距离及标签约束验证
                         // ---------------------------------------------------------
-                        // 只打印前 5 个走到这个分支的 query，避免控制台刷屏
-                        if (count_graph.load() <= 5) {
-                            #pragma omp critical
-                            {
-                                std::cout << "\n[Debug Graph Path] Query ID: " << i << std::endl;
-                                std::cout << "  - Hit Rate: " << hit_rate << " (" << cand_count << " / " << total_num_points << ")" << std::endl;
+                        #pragma omp critical
+                        {
+                            std::cout << "\n[Debug Graph Path] Query ID: " << i << std::endl;
+                            std::cout << "  - Hit Rate: " << hit_rate << " (" << cand_count << " / " << total_num_points << ")" << std::endl;
+                            
+                            // 1. 打印检索出的 Top-K 详细信息
+                            std::cout << "  - [Retrieved Results] (Rank: ID | Dist | Valid?):" << std::endl;
+                            for (size_t j = 0; j < recall_at; j++) {
+                                uint32_t res_id = result_tags[i * recall_at + j];
+                                float res_dist = result_dists[i * recall_at + j];
+                                bool is_valid = candidates.contains(res_id);
                                 
-                                // 1. 打印检索出的 Top-K ID
-                                std::cout << "  - Retrieved IDs: ";
-                                for (size_t j = 0; j < recall_at; j++) {
-                                    std::cout << result_tags[i * recall_at + j] << " ";
-                                }
-                                std::cout << std::endl;
+                                std::cout << "    #" << j << ": " << res_id << " | " << res_dist 
+                                        << " | " << (is_valid ? "YES" : "INVALID!!") << std::endl;
+                            }
 
-                                // 2. 打印 Ground Truth，并检查 GT 是否满足过滤条件
-                                if (calc_recall && gt_ids) {
-                                    std::cout << "  - GroundTruth IDs [In Candidates?]: ";
-                                    size_t hit_count = 0;
-                                    for (size_t j = 0; j < recall_at; j++) {
-                                        uint32_t gt_id = gt_ids[i * gt_dim + j];
-                                        // 检查 GT 是否在 Roaring Bitmap 中
-                                        bool in_cand = candidates.contains(gt_id);
-                                        std::cout << gt_id << (in_cand ? "[Y] " : "[N] ");
-                                        
-                                        // 顺便检查是否被成功召回
-                                        for (size_t k = 0; k < recall_at; k++) {
-                                            if (result_tags[i * recall_at + k] == gt_id) hit_count++;
+                            // 2. 打印 Ground Truth 详细信息（包含距离）
+                            if (calc_recall && gt_ids) {
+                                std::cout << "  - [GroundTruth Data] (Rank: ID | Dist | In_Candidates?):" << std::endl;
+                                size_t hit_count = 0;
+                                for (size_t j = 0; j < recall_at; j++) {
+                                    uint32_t gt_id = gt_ids[i * gt_dim + j];
+                                    float gt_dist = (gt_dists != nullptr) ? gt_dists[i * gt_dim + j] : -1.0f;
+                                    bool in_cand = candidates.contains(gt_id);
+                                    
+                                    std::cout << "    #" << j << ": " << gt_id << " | " << gt_dist 
+                                            << " | " << (in_cand ? "YES" : "NO") << std::endl;
+
+                                    // 检查是否被成功召回
+                                    for (size_t k = 0; k < recall_at; k++) {
+                                        if (result_tags[i * recall_at + k] == gt_id) {
+                                            hit_count++;
+                                            break;
                                         }
                                     }
-                                    std::cout << "\n  - Single Query Recall: " << hit_count << " / " << recall_at << std::endl;
                                 }
-                                std::cout << "---------------------------------------------------------" << std::endl;
+                                std::cout << "  - Single Query Recall: " << hit_count << " / " << recall_at << std::endl;
                             }
+                            std::cout << "---------------------------------------------------------" << std::endl;
                         }
                     }
                 } catch (const std::exception& e) {
