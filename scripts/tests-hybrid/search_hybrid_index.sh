@@ -10,7 +10,7 @@ conda activate psrecord-env
 # 混合搜索工具的可执行文件路径
 SEARCH_TOOL="/home/mabojing/clean-workbase/OdinVectorDB/build/tests/hybrid_tag_search"
 # 磁盘索引前缀路径（不含 _disk.index 后缀）
-INDEX_PREFIX="/home/mabojing/26FAST-PipeANN/res/index/sift1m_index"   # 已是分片构建的版了
+INDEX_PREFIX="/home/mabojing/clean-workbase/sift_R64_L100_M1_B006/sift1m"   # 已是分片构建的版了
 # 查询向量文件
 QUERY_FILE="/home/mabojing/datasets/sift1m/query_gt_pair_query10k_label100/query_vector.bin"
 # Groundtruth文件（若无则填 null）
@@ -24,18 +24,18 @@ QUERY_LABEL_FILE="/home/mabojing/datasets/sift1m/query_gt_pair_query10k_label100
 
 # --- 输出配置 ---
 # 所有生成文件存放的文件夹
-WORK_DIR="/home/mabojing/clean-workbase/search_DEBUG_尝试1m数据集效果"
+WORK_DIR="/home/mabojing/clean-workbase/search_DEBUG_new_stage"
 
 # --- 搜索参数 ---
 DATA_TYPE="float"           # 向量类型：float/int8/uint8
-NUM_THREADS=45              # OpenMP 线程数
+NUM_THREADS=1              # OpenMP 线程数
 BEAMWIDTH=4                 # Beam Search 宽度
 K=10                        # 返回 Top-K 结果
 SIMILARITY="l2"             # 距离度量：l2/cosine
-MEM_L=0                     # 内存索引 L 参数（0 = 不使用内存索引）
-HIT_RATE_THRESHOLD=0.01      # 策略切换阈值
-IVF_TOPL_MULTIPLIER=100       # IVF 粗排扩展倍数
-SEARCH_LISTS="100"   # 搜索列表大小列表（可多个，需 ≥ K）
+MEM_L=10                     # 内存索引 L 参数（0 = 不使用内存索引）
+HIT_RATE_THRESHOLD=1      # 策略切换阈值
+IVF_TOPL_MULTIPLIER=10000       # IVF 粗排扩展倍数
+SEARCH_LISTS="300"   # 搜索列表大小列表（可多个，需 ≥ K）
 
 # --- 日志与监控文件 ---
 APP_LOG="${WORK_DIR}/search_process.log"       # 程序标准输出日志

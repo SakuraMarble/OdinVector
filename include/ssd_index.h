@@ -280,7 +280,7 @@ namespace pipeann {
                         QueryStats *stats = nullptr, tsl::robin_set<uint32_t> *exclude_nodes = nullptr,
                         bool dyn_search_l = true, std::vector<uint64_t> *passthrough_page_ref = nullptr);
                         
-    void do_filter_beam_search(const T *vec, uint32_t mem_L, uint32_t Lsize, const uint32_t beam_width,
+    void do_filter_beam_search(const T *vec, uint32_t k_search, uint32_t mem_L, uint32_t Lsize, const uint32_t beam_width,
                         std::vector<Neighbor> &expanded_nodes_info, tsl::robin_set<uint32_t> *candidate_set, tsl::robin_map<uint32_t, T *> *coord_map = nullptr,
                         QueryStats *stats = nullptr, tsl::robin_set<uint32_t> *exclude_nodes = nullptr,
                         bool dyn_search_l = true, std::vector<uint64_t> *passthrough_page_ref = nullptr);

@@ -562,6 +562,8 @@ std::string recall_string = "Recall@" + std::to_string(recall_at);
 
             #pragma omp for schedule(dynamic, 1)
             for (int64_t i = 0; i < (int64_t)query_num; i++) {
+                // if(i != 272) continue;
+                std::cout << "\nProcessing Query " << i << " / " << query_num << std::endl;
                 try {
                     roaring::Roaring candidates = parser.parse(query_labels[i]);
                     uint64_t cand_count = candidates.cardinality();
