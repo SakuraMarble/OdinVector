@@ -4,6 +4,7 @@
 #include <string.h>
 #include <time.h>
 #include <iostream>
+#include <cstdlib>
 
 #include "log.h"
 #include "timer.h"
@@ -39,6 +40,16 @@ int search_disk_index(int argc, char **argv) {
   uint32_t *tags = nullptr;
   size_t query_num, query_dim, gt_num, gt_dim;
   std::vector<_u64> Lvec;
+  uint64_t new_start_tag = 0;
+  bool report_new_hits = false;
+  if (const char *env = std::getenv("NEW_START_TAG")) {
+    char *endp = nullptr;
+    uint64_t v = std::strtoull(env, &endp, 10);
+    if (endp != env) {
+      new_start_tag = v;
+      report_new_hits = true;
+    }
+  }
 
   bool tags_flag = true;
 
@@ -192,6 +203,20 @@ int search_disk_index(int argc, char **argv) {
     float mean_ios =
         (float) pipeann::get_mean_stats(stats, query_num, [](const pipeann::QueryStats &stats) { return stats.n_ios; });
 
+    double new_hit_pct = 0.0;
+    if (report_new_hits) {
+      const uint64_t total = (uint64_t) recall_at * (uint64_t) query_num;
+      uint64_t hits = 0;
+      for (uint64_t i = 0; i < total; ++i) {
+        if (query_result_tags_32[i] >= new_start_tag) {
+          ++hits;
+        }
+      }
+      if (total > 0) {
+        new_hit_pct = (double) hits * 100.0 / (double) total;
+      }
+    }
+
     delete[] stats;
 
     if (output) {
@@ -207,19 +232,16 @@ int search_disk_index(int argc, char **argv) {
       std::cout << std::setw(6) << L << std::setw(12) << beamwidth << std::setw(12) << qps << std::setw(12)
                 << mean_latency << std::setw(12) << latency_999 << std::setw(12) << mean_hops << std::setw(12)
                 << mean_ios;
+      if (report_new_hits) {
+        std::cout << std::setw(12) << new_hit_pct;
+      }
       if (calc_recall_flag) {
         std::cout << std::setw(12) << recall << std::endl;
       }
     }
   };
 
-  LOG(INFO) << "Use two ANNS for warming up...";
-  uint32_t prev_L = Lvec[0];
-  Lvec[0] = 200;
-  run_tests(0, false);
-  run_tests(0, false);
-  Lvec[0] = prev_L;
-  LOG(INFO) << "Warming up finished.";
+  // Warm-up removed to avoid extra pre-runs before measurement.
 
   std::cout.setf(std::ios_base::fixed, std::ios_base::floatfield);
   std::cout.precision(2);
@@ -228,6 +250,9 @@ int search_disk_index(int argc, char **argv) {
   std::cout << std::setw(6) << "L" << std::setw(12) << "I/O Width" << std::setw(12) << "QPS" << std::setw(12)
             << "AvgLat(us)" << std::setw(12) << "P99 Lat" << std::setw(12) << "Mean Hops" << std::setw(12) << "Mean IOs"
             << std::setw(12);
+  if (report_new_hits) {
+    std::cout << std::setw(12) << "NewHit%";
+  }
   if (calc_recall_flag) {
     std::cout << std::setw(12) << recall_string << std::endl;
   } else

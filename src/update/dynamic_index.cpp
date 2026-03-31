@@ -29,6 +29,7 @@
 #include "linux_aligned_file_reader.h"
 
 namespace pipeann {
+  // 辅助函数：复制索引文件
   void copy_index(const std::string &prefix_in, const std::string &prefix_out) {
     LOG(INFO) << "Copying disk index from " << prefix_in << " to " << prefix_out;
     std::filesystem::copy(prefix_in + "_disk.index", prefix_out + "_disk.index",
@@ -108,7 +109,7 @@ namespace pipeann {
       exit(-1);
     }
 
-    this->_use_mem_index = use_mem_index;
+    this->_use_mem_index = use_mem_index;//走PipeANN的内存索引加速路径
     if (use_mem_index) {
       std::string mem_index_path = disk_prefix_in + "_mem.index";  // use the original one.
       LOG(INFO) << "Use static in-memory index for acceleration, path: " << mem_index_path;
@@ -129,10 +130,10 @@ namespace pipeann {
 
   template<typename T, typename TagT>
   int DynamicSSDIndex<T, TagT>::insert(const T *point, const TagT &tag) {
-    std::shared_lock<std::shared_timed_mutex> lock(_merge_lock);  // prevent merge during insert
+    std::shared_lock<std::shared_timed_mutex> lock(_merge_lock);  // 读写锁，防止合并操作与插入冲突 prevent merge during insert
     journal->append(v2::TxType::kInsert, tag);
     auto *deletion_set = &deletion_sets[active_delete_set];
-    return _disk_index->insert_in_place(point, tag, deletion_set);
+    return _disk_index->insert_in_place(point, tag, deletion_set);// 核心逻辑委托给底层SSDIndex
   }
 
   template<typename T, typename TagT>
@@ -161,6 +162,7 @@ namespace pipeann {
     size_t pos = 0;
 
     for (auto iter : best_vec) {
+      // 检查每个结果标签是否在删除集中（使用 deletion_set->find()）
       if (deletion_set->find(iter.tag) == deletion_set->end()) {
         tags[pos] = iter.tag;
         distances[pos] = iter.dist;
@@ -204,18 +206,45 @@ namespace pipeann {
     active_del[cur_idx].store(false);
   }
 
+  // 最终合并：将内存中的删除应用到磁盘索引，并重建索引文件
   template<typename T, typename TagT>
   void DynamicSSDIndex<T, TagT>::final_merge(const uint32_t &nthreads, const uint32_t &n_sampled_nbrs) {
-    std::unique_lock<std::shared_timed_mutex> lock(_merge_lock);  // only one merge at a time
+    std::unique_lock<std::shared_timed_mutex> lock(_merge_lock);  // 确保同一时间只有一个合并操作在执行（写-写互斥） only one merge at a time
     // _disk_index_in -> _disk_index_out
     save_del_set();
     pipeann::Timer timer;
-    merge(nthreads, n_sampled_nbrs);
+    merge(nthreads, n_sampled_nbrs);// 将内存中的更新（插入和删除）应用到磁盘索引
 
     // TODO(gh): do we really need to reload disk index?
     std::swap(_disk_index_prefix_in, _disk_index_prefix_out);
+    // 磁盘上的索引文件已被合并操作修改,内存中的索引结构需要与磁盘保持一致
     _disk_index->reload(_disk_index_prefix_in.c_str(), _num_threads);
     LOG(INFO) << "Merge time : " << timer.elapsed() / 1000 << " ms";
+  }
+
+  template<typename T, typename TagT>
+  void DynamicSSDIndex<T, TagT>::final_merge_graph(const uint32_t &nthreads) {
+    std::unique_lock<std::shared_timed_mutex> lock(_merge_lock);
+    save_del_set();
+    pipeann::Timer timer;
+    _disk_index->merge_graph_only(_disk_index_prefix_in, _disk_index_prefix_out, nthreads);
+    std::swap(_disk_index_prefix_in, _disk_index_prefix_out);
+    _disk_index->reload(_disk_index_prefix_in.c_str(), _num_threads);
+    LOG(INFO) << "Graph-only merge time : " << timer.elapsed() / 1000 << " ms";
+  }
+
+  template<typename T, typename TagT>
+  void DynamicSSDIndex<T, TagT>::final_merge_stream_pq_tags(const uint32_t &nthreads,
+                                                            const uint32_t &n_sampled_nbrs) {
+    std::unique_lock<std::shared_timed_mutex> lock(_merge_lock);
+    save_del_set();
+    pipeann::Timer timer;
+    _disk_index->merge_deletes_stream_pq_tags(_disk_index_prefix_in, _disk_index_prefix_out,
+                                              deleted_tags[1 - active_delete_set],
+                                              deletion_sets[1 - active_delete_set], nthreads, n_sampled_nbrs);
+    std::swap(_disk_index_prefix_in, _disk_index_prefix_out);
+    _disk_index->reload(_disk_index_prefix_in.c_str(), _num_threads);
+    LOG(INFO) << "Merge(stream PQ/tags) time : " << timer.elapsed() / 1000 << " ms";
   }
 
   template<typename T, typename TagT>

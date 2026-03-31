@@ -1,5 +1,18 @@
 set(CMAKE_CXX_STANDARD 17)
 
+# add - bench-updates
+add_executable(bench_updates bench_updates.cpp)
+target_link_libraries(bench_updates ${PROJECT_NAME})
+# add hot index
+add_executable(hot_update_console hot_update_console.cpp)
+target_link_libraries(hot_update_console ${PROJECT_NAME})
+# add hot service
+add_executable(hot_update_service hot_update_service.cpp)
+target_link_libraries(hot_update_service ${PROJECT_NAME})
+
+add_executable(bench_insert_query_concurrent bench_insert_query_concurrent.cpp)
+target_link_libraries(bench_insert_query_concurrent ${PROJECT_NAME})
+
 add_executable(build_memory_index build_memory_index.cpp)
 target_link_libraries(build_memory_index ${PROJECT_NAME})
 

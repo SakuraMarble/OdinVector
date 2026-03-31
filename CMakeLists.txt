@@ -30,8 +30,10 @@ add_definitions(
 	-DNDEBUG
 	# -DUSE_AIO
 	# -DIN_PLACE_RECORD_UPDATE # disable design #1
+	#-DTAGS_IDENTITY_ONLY # hardcode tag==id, skip loading tags map
+	# -DIDENTITY_MAPPING_ONLY # id==loc, skip id2loc/page_layout build
 	# -DDIRECT_READ_CC # disable opt #1.1
-	# -DBG_IO_THREAD # enable opt #1.2
+	-DBG_IO_THREAD # enable opt #1.2
 	# -DDELTA_PRUNING # enable opt #2
 
 	# -DNO_POLLUTE_ORIGINAL
@@ -126,3 +128,28 @@ add_subdirectory(src)
 add_subdirectory(tests)
 add_subdirectory(tests/utils)
 # add_subdirectory(python)
+add_executable(test_insert tests/test_insert.cpp)
+set_target_properties(test_insert PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+)
+
+
+# 链接库保持不变 
+target_link_libraries(test_insert 
+    pipeann 
+    ${OpenMP_CXX_FLAGS}
+    ${BLAS_LIBRARIES} # 建议加上这个，防止缺少数学库链接
+)
+
+# add_subdirectory(python)
+add_executable(insert_demo tests/insert_demo.cpp)
+set_target_properties(insert_demo PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+)
+
+# 链接库保持不变 
+target_link_libraries(insert_demo 
+    pipeann 
+    ${OpenMP_CXX_FLAGS}
+    ${BLAS_LIBRARIES} # 建议加上这个，防止缺少数学库链接
+)

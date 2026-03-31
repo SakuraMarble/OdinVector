@@ -99,7 +99,10 @@ void LinuxAlignedFileReader::deregister_all_threads() {
 }
 
 void LinuxAlignedFileReader::open(const std::string &fname, bool enable_writes = false, bool enable_create = false) {
-  int flags = O_DIRECT | O_LARGEFILE | O_RDWR;
+  int flags = O_LARGEFILE | O_RDWR;
+#ifndef NO_DIRECT_IO
+  flags |= O_DIRECT;
+#endif
   if (enable_create) {
     flags |= O_CREAT;
   }
@@ -345,7 +348,10 @@ void LinuxAlignedFileReader::deregister_all_threads() {
 }
 
 void LinuxAlignedFileReader::open(const std::string &fname, bool enable_writes = false, bool enable_create = false) {
-  int flags = O_DIRECT | O_LARGEFILE | O_RDWR;
+  int flags = O_LARGEFILE | O_RDWR;
+#ifndef NO_DIRECT_IO
+  flags |= O_DIRECT;
+#endif
   if (enable_create) {
     flags |= O_CREAT;
   }

@@ -1,5 +1,5 @@
-#include "ssd_index.h"
-#include "v2/dynamic_index.h"
+#include "ssd_index.h"// 基类SSDIndex声明，提供静态索引功能
+#include "v2/dynamic_index.h"// DynamicSSDIndex声明，提供动态插入功能
 
 #include <index.h>
 #include <cstddef>
@@ -35,12 +35,12 @@ int begin_time = 0;
 pipeann::Timer globalTimer;
 
 // acutually also shows disk size
-void ShowMemoryStatus(const std::string &filename) {
+void ShowMemoryStatus(const std::string &filename) {// 系统资源监控
   int current_time = globalTimer.elapsed() / 1.0e6f - begin_time;
 
   int tSize = 0, resident = 0, share = 0;
   std::ifstream buffer("/proc/self/statm");
-  buffer >> tSize >> resident >> share;
+  buffer >> tSize >> resident >> share;// 从Linux内核获取内存统计
   buffer.close();
   long page_size_kb = sysconf(_SC_PAGE_SIZE) / 1024;  // in case x86-64 is configured to use 2MB pages
   double rss = resident * page_size_kb;
@@ -48,7 +48,7 @@ void ShowMemoryStatus(const std::string &filename) {
   struct stat st;
   memset(&st, 0, sizeof(struct stat));
   std::string index_file_name = filename + "_disk.index";
-  stat(index_file_name.c_str(), &st);
+  stat(index_file_name.c_str(), &st); // 获取索引文件大小
 
   LOG(INFO) << " memory current time: " << current_time << " RSS : " << rss << " KB " << index_file_name
             << " Index size " << (st.st_size / (1 << 20)) << " MB";
@@ -60,6 +60,7 @@ std::string convertFloatToString(const float value, const int precision = 0) {
   return stream.str();
 }
 
+// 动态生成真值文件名，支持增量测试
 std::string GetTruthFileName(const std::string &truthFilePrefix, int l_start) {
   std::string fileName(truthFilePrefix);
   fileName = fileName + "/gt_" + std::to_string(l_start) + ".bin";
@@ -77,10 +78,11 @@ inline uint64_t save_bin_test(const std::string &filename, T *id, float *dist, s
   writer.seekp(offset, writer.beg);
   int npts_i32 = (int) npts, ndims_i32 = (int) ndims;
   size_t bytes_written = npts * ndims * sizeof(T) + 2 * sizeof(uint32_t);
+  // 写入数据点数量和维度信息作为文件头部
   writer.write((char *) &npts_i32, sizeof(int));
   writer.write((char *) &ndims_i32, sizeof(int));
   LOG(INFO) << "bin: #pts = " << npts << ", #dims = " << ndims << ", size = " << bytes_written << "B";
-
+  // 写入数据点的ID和距离信息
   for (int i = 0; i < npts; i++) {
     for (int j = 0; j < ndims; j++) {
       writer.write((char *) (id + i * ndims + j), sizeof(T));
@@ -111,10 +113,10 @@ void sync_search_kernel(T *query, size_t query_num, size_t query_dim, const int 
     LOG(INFO) << "current truthfile: " << truthset_file;
     pipeann::load_truthset(truthset_file, gt_ids, gt_dists, gt_num, gt_dim);
   }
-
+  // 为查询结果的距离和标签分配内存
   float *query_result_dists = new float[recall_at * query_num];
   TagT *query_result_tags = new TagT[recall_at * query_num];
-
+  // 初始化查询结果为最大值
   for (_u32 q = 0; q < query_num; q++) {
     for (_u32 r = 0; r < (_u32) recall_at; r++) {
       query_result_tags[q * recall_at + r] = std::numeric_limits<TagT>::max();
@@ -133,6 +135,7 @@ void sync_search_kernel(T *query, size_t query_num, size_t query_dim, const int 
                "==============="
             << std::endl;
   auto s = std::chrono::high_resolution_clock::now();
+// OpenMP多线程执行搜索
 #pragma omp parallel for num_threads(NUM_SEARCH_THREADS) schedule(dynamic)
   for (int64_t i = 0; i < (int64_t) query_num; i++) {
     sync_index.search(query + i * query_dim, recall_at, mem_L, L, beam_width, query_result_tags + i * recall_at,
@@ -187,15 +190,15 @@ template<typename T, typename TagT>
 void insertion_kernel(T *data_load, pipeann::DynamicSSDIndex<T, TagT> &sync_index, std::vector<TagT> &insert_vec,
                       size_t dim) {
   pipeann::Timer timer;
-  size_t npts = insert_vec.size();
-  std::vector<double> insert_latencies(npts, 0);
+  size_t npts = insert_vec.size();// 待插入点的数量
+  std::vector<double> insert_latencies(npts, 0);// 存储每个插入操作的延迟时间
   LOG(INFO) << "Begin Insert";
   std::atomic_size_t success(0);
 
 #pragma omp parallel for num_threads(NUM_INSERT_THREADS)
-  for (_s64 i = 0; i < (_s64) insert_vec.size(); i++) {
+  for (_s64 i = 0; i < (_s64) insert_vec.size(); i++) {//插入向量列表中的每个元素执行插入
     pipeann::Timer insert_timer;
-    sync_index.insert(data_load + dim * i, insert_vec[i]);
+    sync_index.insert(data_load + dim * i, insert_vec[i]);//传入数据向量和标签
     success++;
     insert_latencies[i] = ((double) insert_timer.elapsed());
   }
@@ -216,21 +219,23 @@ void get_trace(std::string data_bin, uint64_t l_start, uint64_t r_start, uint64_
   LOG(INFO) << "l_start: " << l_start << " r_start: " << r_start << " n: " << n;
 
   for (uint64_t i = l_start; i < l_start + n; ++i) {
-    delete_tags.push_back(i);
+    delete_tags.push_back(i);//将连续的标签值添加到 delete_tags 向量中，表示要删除的向量标签
   }
 
   for (uint64_t i = r_start; i < r_start + n; ++i) {
-    insert_tags.push_back(i);
+    insert_tags.push_back(i);// 将连续的标签值添加到 insert_tags 向量中，表示要插入的向量标签
   }
 
   // load data, load n vecs from r_start.
   int npts_i32, dim_i32;
   std::ifstream reader(data_bin, std::ios::binary | std::ios::ate);
+  // 读取指针移到文件开头 读取店数和维度信息
   reader.seekg(0, reader.beg);
   reader.read((char *) &npts_i32, sizeof(int));
   reader.read((char *) &dim_i32, sizeof(int));
 
   size_t data_dim = dim_i32;
+  // 重新设置 data_load 向量的大小，使其能够容纳 n 个向量，每个向量有 data_dim 个元素
   data_load.resize(n * data_dim);
   reader.seekg(2 * sizeof(int) + r_start * data_dim * sizeof(T), reader.beg);
   reader.read((char *) data_load.data(), sizeof(T) * n * data_dim);
@@ -241,7 +246,7 @@ void update(const std::string &data_bin, const unsigned L_disk, int vecs_per_ste
             const std::string &index_prefix, const std::string &query_file, const std::string &truthset_file,
             size_t truthset_l_offset, const int recall_at, const std::vector<_u64> &Lsearch, const unsigned beam_width,
             const uint32_t search_beam_width, const uint32_t search_mem_L, pipeann::Distance<T> *dist_cmp) {
-  pipeann::Parameters paras;
+  pipeann::Parameters paras;// 创建参数对象
   paras.Set<unsigned>("L_disk", L_disk);
   paras.Set<unsigned>("R_disk", 0);
   paras.Set<float>("alpha_disk", 1.2);
@@ -267,11 +272,11 @@ void update(const std::string &data_bin, const unsigned L_disk, int vecs_per_ste
   LOG(INFO) << "Searching before inserts: ";
 
   uint64_t res = 0;
-
+  // 获取当前真值文件名
   std::string currentFileName = GetTruthFileName(truthset_file, res + truthset_l_offset);
   begin_time = globalTimer.elapsed() / 1.0e6f;
   ShowMemoryStatus(sync_index._disk_index_prefix_in);
-
+  // 遍历不同的 Lsearch 值进行搜索测试，记录磁盘 IO
   std::vector<double> ref_diskio;
   for (size_t j = 0; j < Lsearch.size(); ++j) {
     double diskio = 0;
@@ -293,21 +298,23 @@ void update(const std::string &data_bin, const unsigned L_disk, int vecs_per_ste
     uint64_t ed = st + index_npts;
     LOG(INFO) << "st: " << st << " ed: " << ed;
     get_trace<T, TagT>(data_bin, st, ed, vecs_per_step, delete_vec, insert_vec, data_load);
-
+    // 异步插入操作
     std::future<void> insert_future = std::async(std::launch::async, insertion_kernel<T, TagT>, data_load.data(),
                                                  std::ref(sync_index), std::ref(insert_vec), dim);
 
     int total_queries = 0;
     std::future_status insert_status;
     do {
+      // 轮询检查插入操作是否完成
       insert_status = insert_future.wait_for(std::chrono::seconds(5));
       if (insert_status == std::future_status::deferred) {
         LOG(INFO) << "deferred\n";
       } else if (insert_status == std::future_status::timeout) {
         ShowMemoryStatus(sync_index._disk_index_prefix_in);
         LOG(INFO) << "Number of vectors: " << sync_index._disk_index->cur_id;
-        double dummy;
+        double dummy;// 占位变量，用于接收磁盘 IO 结果
         // for (uint32_t j = 0; j < Lsearch.size(); ++j) {
+        // 插入过程中执行搜索操作，测试系统的并发性能
         sync_search_kernel(query, query_num, query_dim, recall_at, search_mem_L, Lsearch[0], search_beam_width,
                            sync_index, currentFileName, false, false, dummy);
         sleep(1);
@@ -323,11 +330,12 @@ void update(const std::string &data_bin, const unsigned L_disk, int vecs_per_ste
     inMemorySize += insert_vec.size();
 
     LOG(INFO) << "Search after update, current vector number: " << res;
-
+    // 更新当前真值文件名
     res += vecs_per_step;
     currentFileName = GetTruthFileName(truthset_file, res + truthset_l_offset);
-
+    
     std::vector<double> disk_ios;
+    // 遍历不同的 Lsearch 值进行搜索测试，记录磁盘 IO
     for (size_t j = 0; j < Lsearch.size(); ++j) {
       double diskio = 0;
       sync_search_kernel(query, query_num, query_dim, recall_at, search_mem_L, Lsearch[j], search_beam_width,
@@ -335,6 +343,7 @@ void update(const std::string &data_bin, const unsigned L_disk, int vecs_per_ste
       disk_ios.push_back(diskio);
     }
 
+    // 在最后一步且步骤数 ≥ 10 时，将最终索引合并到磁盘
     if (i == num_steps - 1 && num_steps >= 10) {  // store the last index, figs 9 and 11 uses num_steps < 10.
       LOG(INFO) << "Store the last index to disk.";
       merge_future = std::async(std::launch::async, merge_kernel<T, TagT>, std::ref(sync_index));
@@ -361,7 +370,7 @@ int main(int argc, char **argv) {
   std::string data_bin = std::string(argv[arg_no++]);
   unsigned L_disk = (unsigned) atoi(argv[arg_no++]);
 
-  // 1M vectors per step.
+  // 1M vectors per step. 每次更新处理的向量数量（注释说明每步100万向量）
   int vecs_per_step = (int) std::atoi(argv[arg_no++]);
 
   // 100 steps for 100M + 100M test, 200 steps for 800M + 200M test.
