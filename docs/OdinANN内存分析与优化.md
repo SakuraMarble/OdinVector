@@ -116,7 +116,11 @@ int estimate_cluster_sizes(const std::string data_file, float *pivots, const siz
 
 * 公式：
 
-  $$M_{merge} = \underbrace{(N \times R \times 4)}_{\text{idmaps}} + \underbrace{(N \times R \times 8)}_{\text{node\_shard}} + M_{ReadBuffers} + \underbrace{\frac{N}{8}}_{\text{bitmap}}$$
+  
+  $$
+  M_{merge} = \underbrace{(N \times R \times 4)}_{\text{idmaps}} + \underbrace{(N \times R \times 8)}_{\text{node\_shard}} + M_{ReadBuffers} + \underbrace{\frac{N}{8}}_{\text{bitmap}}
+  $$
+  
 
   * $idmaps$：ID映射表。将所有分片中旧 ID 到新 ID 的映射全部加载到了内存中。
   * $node\_shard$：反向映射表。将所有分片中全局新 ID 到旧 ID 的映射全部加载到了内存中。
@@ -261,11 +265,7 @@ for (size_t p = 0; p < cur_blk_size; p++) {
 
 引入应用层buffer，为每个buffer安排一个1MB大小的写缓冲区，当向量写满缓冲区后再进行落盘。
 
-
-
-###### 代码已更新，正在进行新实验：在经过上述修改后的实验后发现还可以省下5GB的内存峰值，通过优化分片时测试集的采样逻辑实现
-
-![b8fdd017b80993212d1f113e47ae18d2](D:\Wechat\WechatStoreFiles\xwechat_files\wxid_fk3e9jhq09ne22_c45e\temp\RWTemp\2026-02\9e20f478899dc29eb19741386f9343c8\b8fdd017b80993212d1f113e47ae18d2.png)
+###### 在经过上述修改后的实验后发现还可以省下5GB的内存峰值，通过优化分片时测试集的采样逻辑实现
 
 在经过试验后发现：之前为了训练K-Means采样了一个训练数据集，然后为了估算聚类后每个分片的大小，又采样了一个测试数据集。然而，测试数据集的采样率为硬编码的0.01，没有像训练数据集一样有最大绝对体积的限制，因此在10亿128维向量的情况下，0.01的采样率就是1000万条数据，并且转化成了float类型，因此刚好就是5GB。
 
@@ -302,11 +302,22 @@ void gen_random_slice(const std::string data_file, double p_val, float *&sampled
 
 $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
-* $$M_{single} = \phi \cdot \left( \underbrace{N \cdot (D \cdot 4 \cdot \sigma + 24)}_{\text{Graph Storage}} + \underbrace{N \cdot \lceil dim \rceil_8 \cdot B_{data}}_{\text{Data Storage}} \right)$$
-  * 这里将 `SLACK_FACTOR` 记作 $\sigma$（冗余因子），`OVERHEAD_FACTOR` 记作 $\phi$（开销系数），并将 `ROUND_UP(dim, 8)` 记作 $\lceil dim \rceil_8$（8字节对齐后的维度）。
-  * $\phi=1.1$
-  * $\sigma=1.3$
-* $M_{merge} = \underbrace{(N \times R \times 4)}_{\text{idmaps}} + \underbrace{(N \times R \times 8)}_{\text{node\_shard}} + M_{ReadBuffers} + \underbrace{\frac{N}{8}}_{\text{bitmap}}$
+
+$$
+M_{single} = \phi \cdot \left( \underbrace{N \cdot (D \cdot 4 \cdot \sigma + 24)}_{\text{Graph Storage}} + \underbrace{N \cdot \lceil dim \rceil_8 \cdot B_{data}}_{\text{Data Storage}} \right)
+$$
+
+
+* 这里将 `SLACK_FACTOR` 记作 $\sigma$（冗余因子），`OVERHEAD_FACTOR` 记作 $\phi$（开销系数），并将 `ROUND_UP(dim, 8)` 记作 $\lceil dim \rceil_8$（8字节对齐后的维度）。
+* $\phi=1.1$
+* $\sigma=1.3$
+
+* 
+  $$
+  M_{merge} = \underbrace{(N \times R \times 4)}_{\text{idmaps}} + \underbrace{(N \times R \times 8)}_{\text{node\_shard}} + M_{ReadBuffers} + \underbrace{\frac{N}{8}}_{\text{bitmap}}
+  $$
+  
+
 * OVERHEAD=1.2
 
 ##### 估算准确度提升
@@ -315,7 +326,7 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
   * 真实峰值250G，估算峰值16GB
 
-    ![image-20260226120129431](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20260226120129431.png)
+    ![memory-image1](../images/memory-image1.png)
 
   * 相对误差率：$\frac{|V_{actual} - V_{estimated}|}{V_{actual}}=93.6\%$
 
@@ -323,17 +334,17 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
   第二版优化后：
 
-  ![image-20260227111442532](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20260227111442532.png)
+  ![memory-image2](../images/memory-image2.png)
 
-  * 真实峰值：29GB**（分片构建期间5GB的底座问题没有解决，经分析大概率是内存碎片）**
+  * 真实峰值：29GB **（分片构建期间5GB的底座问题没有解决，经分析大概率是内存碎片）** 
 
-  * 估算峰值：$M_{build} = max(M_{single}，M_{merge}) * OVERHEAD=31GB$
+  * 估算峰值： $M_{build} = max(M_{single}，M_{merge}) * OVERHEAD=31GB$ 
 
     * $M_{single}=16GB$
 
     * $M_{merge}$计算：
 
-      - **idmaps**: $N \times R \times 4 = 10^9 \times 2 \times 4 = 8,000,000,000$ 字节 ($\approx 7.45$ GiB)
+      - **idmaps**:  $N \times R \times 4 = 10^9 \times 2 \times 4 = 8,000,000,000$  字节 ($\approx 7.45$ GiB)
       - **node_shard**: $N \times R \times 8 = 10^9 \times 2 \times 8 = 16,000,000,000$ 字节 ($\approx 14.90$ GiB)
       - **M_{ReadBuffers}**: $48 \times 64 \text{ MB} = 3,072 \text{ MB} = 3,221,225,472$ 字节 ($3$ GiB)
       - **bitmap**: $\frac{N}{8} = \frac{10^9}{8} = 125,000,000$ 字节 ($\approx 0.12$ GiB)
@@ -346,7 +357,7 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
       $$27,346,225,472 \div 1024^3 \approx \mathbf{25.47 \text{ GiB}}$$
 
-  * 相对误差率：$\frac{|V_{actual} - V_{estimated}|}{V_{actual}}=6\%$
+  * 相对误差率：  $\frac{|V_{actual} - V_{estimated}|}{V_{actual}}=6\%$  
 
 * 总结：估算误差率可由原本的93.6%降低至6%，实现了精确估算构建时内存峰值。观察多次构建记录发现这部分的值大约都是5GB左右，因此为了保证估算值大于真实值，在现有估算公式基础上增大一定比例。
 
@@ -360,7 +371,7 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
 > PQ量化压缩向量磁盘上大小：17.7GB，没有tags文件
 
-![image-20260226185150014](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20260226185150014.png)
+![memory-image3](../images/memory-image3.png)
 
 * 0-15s：线性上升的为17.7GB的PQ量化向量、以及PQ中心点开销
 * 15~150s：加载SSDIndex的开销
@@ -390,9 +401,13 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
   这是数据本身占用的常驻内存，主要包含压缩后的量化特征和 PQ 的查找表。
 
-  $$M_{PQ} = \underbrace{(N \times n_{chunks} \times 1 \text{ Byte})}_{\text{data (压缩向量)}} + \underbrace{(256 \times D \times 4 \text{ Bytes})}_{\text{pq\_table (PQ质心表)}}$$
+  
+  $$
+  M_{PQ} = \underbrace{(N \times n_{chunks} \times 1 \text{ Byte})}_{\text{data (压缩向量)}} + \underbrace{(256 \times D \times 4 \text{ Bytes})}_{\text{pq\_table (PQ质心表)}}
+  $$
+  
 
-  > **代入数据**：$10^9 \times 19 + 256 \times 128 \times 4 \approx \mathbf{17.7 \text{ GB}}$
+  > **代入数据**： $10^9 \times 19 + 256 \times 128 \times 4 \approx \mathbf{17.7 \text{ GB}}$ 
 
   ------
 
@@ -400,7 +415,11 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
   在不开启 `NO_MAPPING` 宏的情况下，需要记录每个点的逻辑 `id` (`uint32_t`) 到磁盘物理 `loc` (`uint32_t`) 的映射。
 
-  $$M_{id2loc} = \underbrace{(N \times (4 \text{ Bytes} + 4 \text{ Bytes}))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}$$
+  
+  $$
+  M_{id2loc} = \underbrace{(N \times (4 \text{ Bytes} + 4 \text{ Bytes}))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}
+  $$
+  
 
   ```cpp
   libcuckoo::cuckoohash_map<uint32_t, uint32_t> id2loc_;  // id -> loc
@@ -409,7 +428,7 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
   * SSD 图索引通过逻辑 ID 来表示节点。但在磁盘上，节点按照紧凑的物理顺序 (`loc`) 存储。为了在搜索时知道一个逻辑 ID 对应在磁盘的哪个位置，必须在内存中维护一个映射表：`ID (uint32_t) -> Loc (uint32_t)`。
   * 为什么会有 $\alpha_{cuckoo}$ 膨胀系数？代码使用了 `libcuckoo::cuckoohash_map` 这种支持高并发的哈希表。为了避免哈希冲突和保证并发读写性能，哈希表不能 100% 填满（通常装载率达到 50%~70% 就会触发扩容，底层数组大小通常是 2 的幂），因此实际分配的内存大约是数据的 1.5 到 2 倍。
 
-  > **代入数据**：$10^9 \times 8 \times (1.5 \sim 2.0) \approx \mathbf{12 \text{ GB}} \sim \mathbf{16 \text{ GB}}$
+  > **代入数据**： $10^9 \times 8 \times (1.5 \sim 2.0) \approx \mathbf{12 \text{ GB}} \sim \mathbf{16 \text{ GB}}$ 
 
   ------
 
@@ -417,7 +436,11 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
   记录每个磁盘页（Page/Sector，`uint32_t` 作为 Key）内部按顺序存放了哪些 ID（`PageArr` = 16 个 `uint32_t` 作为 Value）。
 
-  $$M_{page\_layout} = \underbrace{\left( \lceil \frac{N}{P_{nodes}} \rceil \times (4 \text{ Bytes} + 16 \times 4 \text{ Bytes}) \right)}_{\text{基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}$$
+  
+  $$
+  M_{page\_layout} = \underbrace{\left( \lceil \frac{N}{P_{nodes}} \rceil \times (4 \text{ Bytes} + 16 \times 4 \text{ Bytes}) \right)}_{\text{基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}
+  $$
+  
 
   ```cpp
   static constexpr uint32_t kMaxElemInAPage = 16;
@@ -429,9 +452,9 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
   * $\lceil \frac{N}{P_{nodes}} \rceil$ 表示总页数（10亿个点，每页 15 个点，共约 6666 万页）。
 
-  * Key 是 Page ID（`uint32_t`，$4 \text{ Bytes}$），Value 是一个包含 16 个元素的数组 `PageArr`（不足 16 个的补空），每个元素是节点的 ID（`uint32_t`，$4 \text{ Bytes}$），因此 Value 占 $64 \text{ Bytes}$。同样的，受 `cuckoohash_map` 膨胀率影响。
+  * Key 是 Page ID（`uint32_t`， $4 \text{ Bytes}$ ），Value 是一个包含 16 个元素的数组 `PageArr`（不足 16 个的补空），每个元素是节点的 ID（`uint32_t`， $4 \text{ Bytes}$ ），因此 Value 占 $64 \text{ Bytes}$。同样的，受 `cuckoohash_map` 膨胀率影响。
 
-  > **代入数据**：$(10^9 / 15) \times 68 \times (1.5 \sim 2.0) \approx \mathbf{6.8 \text{ GB}} \sim \mathbf{9.1 \text{ GB}}$
+  > **代入数据**： $(10^9 / 15) \times 68 \times (1.5 \sim 2.0) \approx \mathbf{6.8 \text{ GB}} \sim \mathbf{9.1 \text{ GB}}$ 
 
   ------
 
@@ -439,7 +462,11 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
   程序为每个线程预分配了 2 个 `QueryBuffer` 对象（用于实现双缓冲及后台异步 I/O）。
 
-  $$M_{buffers} = \underbrace{(2 \times N_{threads})}_{\text{Buffer总数}} \times \Big( \underbrace{(16384 \times D_{align} \times \text{sizeof}(T))}_{\text{coord\_scratch}} + \underbrace{(N_{sector} \times 4096)}_{\text{sector\_scratch}} + \underbrace{(32768 \times 32 \times 1)}_{\text{aligned\_pq\_coord}} \Big)$$
+  
+  $$
+  M_{buffers} = \underbrace{(2 \times N_{threads})}_{\text{Buffer总数}} \times \Big( \underbrace{(16384 \times D_{align} \times \text{sizeof}(T))}_{\text{coord\_scratch}} + \underbrace{(N_{sector} \times 4096)}_{\text{sector\_scratch}} + \underbrace{(32768 \times 32 \times 1)}_{\text{aligned\_pq\_coord}} \Big)
+  $$
+  
 
   *(注：$N_{sector}$ 对应代码中的 `MAX_N_SECTOR_READS`，通常预设为 1024 左右)*
 
@@ -451,7 +478,11 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
   如果开启了 `enable_tags`（且有外部标签文件），还需要建立内部 `id` 到外部 `TagT` 类型的映射。
 
-  $$M_{tags} = \underbrace{(N \times (4 \text{ Bytes} + \text{sizeof}(TagT)))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}$$
+  
+  $$
+  M_{tags} = \underbrace{(N \times (4 \text{ Bytes} + \text{sizeof}(TagT)))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}
+  $$
+  
 
   > **代入数据**：日志中标签数为 0，因此当前为 $\mathbf{0 \text{ GB}}$。如果全量加载 `uint32_t` 标签，又将是额外的 $\mathbf{12 \sim 16 \text{ GB}}$。
 
@@ -472,11 +503,11 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
 **bigann_0.99B_R48_L100_B30_M85插入10M向量后搜索内存开销**
 
-![image-20260226190919552](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20260226190919552.png)
+![memory-image4](../images/memory-image4.png)
 
 **0.99B BIGANN  R64_L100_B60 + 10M向量搜索时开销**
 
-![image-20260226191015618](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20260226191015618.png)
+![memory-image5](../images/memory-image5.png)
 
 可以发现峰值大约都等于**PQ量化向量大小+25GB**，其中**25GB**是我们磁盘页面布局表开销、id磁盘位置映射表的开销、IO缓存的开销，大致只与N有关，因此保持不变，进一步验证了估算的准确性。
 
@@ -486,7 +517,7 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
 
 > 目前使用的实验工具为test_insert_search，在插入过程中并行在执行搜索过程。参数遗漏记录了
 
-![psrecord_insert_0.99B_to_1.00B](C:\Users\Administrator\Downloads\psrecord_insert_0.99B_to_1.00B.png)
+![memory-image6](../images/memory-image6.png)
 
 * 在test_insert_search中，存在DynamicSSDIndex构造函数，这里加载了许多磁盘上的信息，产生了巨大开销
 
@@ -576,7 +607,7 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
       }
   ```
 
-* **总结**：
+* **总结** ：
 
   初始内存总计128GB，包括：
 
@@ -669,13 +700,13 @@ $M_{build} = max(M_{single}，M_{merge})*OVERHEAD$
   * 最初：源代码此处申请原PQ1.5倍的内存，然后拷贝一份旧PQ到此处为后续向量留出空间，释放旧PQ内存
   * 末尾merge一下子申请一个全新的PQ数组
 
-  ![image-20260226191455982](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20260226191455982.png)
+  ![memory-image7](../images/memory-image7.png)
 
 * 优化后：
 
   > bigann_0.99B_R48_L100_B30_M85 T40，内存峰值为53GB
 
-  ![image-20260226191629972](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20260226191629972.png)
+  ![memory-image8](../images/memory-image8.png)
 
 * **总结：**
 
@@ -730,9 +761,16 @@ libcuckoo::cuckoohash_map<uint32_t, std::vector<uint32_t>> deleted_nhoods;  // i
 
 开销主要存在于`merge`阶段。需要比`insert`时的`merge`多考虑`idmap`以及`deleted_nhoods`的开销。
 
-$$M_{idmap} = \underbrace{(N \times (4 \text{ Bytes} + 4 \text{ Bytes}))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}$$
+$$
+M_{idmap} = \underbrace{(N \times (4 \text{ Bytes} + 4 \text{ Bytes}))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}
+$$
 
-$M_{deleted\_nhoods}=\underbrace{n \times (4\ \text{Bytes} + 24\ \text{Bytes} + 4\ \text{Bytes} \times R)}_{键值对基础大小} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}$，其中R为最大邻居数目
+$$
+M_{deleted\_nhoods}=\underbrace{n \times (4\ \text{Bytes} + 24\ \text{Bytes} + 4\ \text{Bytes} \times R)}_{键值对基础大小} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}
+$$
+
+
+其中R为最大邻居数目
 
 #### 系统性总结
 
@@ -755,31 +793,56 @@ $M_{deleted\_nhoods}=\underbrace{n \times (4\ \text{Bytes} + 24\ \text{Bytes} + 
 
 ##### 公式
 
-> 由于构建过程独立于搜索、插入、删除过程，我们考虑构建好一个索引后，该服务器只维护该索引、只在该索引上进行查询，因此整个系统的内存峰值应为：$max(M_{build}, M_{search\_update})$
+> 由于构建过程独立于搜索、插入、删除过程，我们考虑构建好一个索引后，该服务器只维护该索引、只在该索引上进行查询，因此整个系统的内存峰值应为： $max(M_{build}, M_{search\_update})$ 
 
-$M_{search\_update}=M_{load} + M_{delete\_inc}$，构建好索引的OdinANN系统运作过程中，峰值为搜索时峰值、插入时峰值与删除时峰值的最大值。然而经过前面的分析，搜索、插入和删除的最大开销就是加载的索引`SSDIndex`开销，而删除会在`merge`期间额外申请`idmap`和`delete_nhoods`内存，这一定是三者中最大的情形，因此构建好索引的OdinANN系统运作过程的内存峰值公式可以简化为 上述形式
+$M_{search\_update}=M_{load} + M_{delete\_inc}$，构建好索引的OdinANN系统运作过程中，峰值为搜索时峰值、插入时峰值与删除时峰值的最大值。然而经过前面的分析，搜索、插入和删除的最大开销就是加载的索引`SSDIndex`开销，而删除会在`merge`期间额外申请`idmap`和`delete_nhoods`内存，这一定是三者中最大的情形，因此构建好索引的OdinANN系统运作过程的内存峰值公式可以简化为上述形式
 
 $M_{system}=max(M_{build},M_{search\_update}) * OVERHEAD$
 
 * $M_{build} = max(M_{single}，M_{merge})$
 
-  * $$M_{single} = \phi \cdot \left( \underbrace{N \cdot (D \cdot 4 \cdot \sigma + 24)}_{\text{Graph Storage}} + \underbrace{N \cdot \lceil dim \rceil_8 \cdot B_{data}}_{\text{Data Storage}} \right)$$
+  * $$
+    M_{single} = \phi \cdot \left( \underbrace{N \cdot (D \cdot 4 \cdot \sigma + 24)}_{\text{Graph Storage}} + \underbrace{N \cdot \lceil dim \rceil_8 \cdot B_{data}}_{\text{Data Storage}} \right)
+    $$
+    
     * 这里将 `SLACK_FACTOR` 记作 $\sigma$（冗余因子），`OVERHEAD_FACTOR` 记作 $\phi$（开销系数），并将 `ROUND_UP(dim, 8)` 记作 $\lceil dim \rceil_8$（8字节对齐后的维度）。
     * $\phi=1.1$
     * $\sigma=1.3$
-  * $M_{merge} = \underbrace{(N \times R \times 4)}_{\text{idmaps}} + \underbrace{(N \times R \times 8)}_{\text{node\_shard}} + M_{ReadBuffers} + \underbrace{\frac{N}{8}}_{\text{bitmap}}$
+    
+  * $$
+    M_{merge} = \underbrace{(N \times R \times 4)}_{\text{idmaps}} + \underbrace{(N \times R \times 8)}_{\text{node\_shard}} + M_{ReadBuffers} + \underbrace{\frac{N}{8}}_{\text{bitmap}}
+    $$
+  
   * **OVERHEAD=1.2**
+  
 * $M_{search\_update}=M_{load} + M_{delete\_inc}$
   * $$M_{load} = M_{PQ} + M_{id2loc} + M_{page\_layout} + M_{buffers}(太小，忽略) + M_{tags}(可选)$$
     * $M_{PQ}$是构建时配置好的B参数
-    * $$M_{id2loc} = \underbrace{(N \times (4 \text{ Bytes} + 4 \text{ Bytes}))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}$$
-    * $$M_{page\_layout} = \underbrace{\left( \lceil \frac{N}{P_{nodes}} \rceil \times (4 \text{ Bytes} + 16 \times 4 \text{ Bytes}) \right)}_{\text{基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}$$
-    * $$M_{tags} = \underbrace{(N \times (4 \text{ Bytes} + \text{sizeof}(TagT)))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}$$
+    
+    * $$
+      M_{id2loc} = \underbrace{(N \times (4 \text{ Bytes} + 4 \text{ Bytes}))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}
+      $$
+    
+    * $$
+      M_{page\_layout} = \underbrace{\left( \lceil \frac{N}{P_{nodes}} \rceil \times (4 \text{ Bytes} + 16 \times 4 \text{ Bytes}) \right)}_{\text{基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}
+      $$
+    
+    * $$
+      M_{tags} = \underbrace{(N \times (4 \text{ Bytes} + \text{sizeof}(TagT)))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}
+      $$
+    
   * $M_{delete\_inc} = M_{idmap} + M_{deleted\_nhoods}$
-    * $$M_{idmap} = \underbrace{(N \times (4 \text{ Bytes} + 4 \text{ Bytes}))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}$$
-    * $M_{deleted\_nhoods}=\underbrace{n \times (4\ \text{Bytes} + 24\ \text{Bytes} + 4\ \text{Bytes} \times R)}_{键值对基础大小} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}$，其中R为最大邻居数目
+    * $$
+      M_{idmap} = \underbrace{(N \times (4 \text{ Bytes} + 4 \text{ Bytes}))}_{\text{键值对基础大小}} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}
+      $$
+    
+    * $$
+      M_{deleted\_nhoods}=\underbrace{n \times (4\ \text{Bytes} + 24\ \text{Bytes} + 4\ \text{Bytes} \times R)}_{键值对基础大小} \times \underbrace{\alpha_{cuckoo}}_{\text{哈希表膨胀系数}}
+      $$
+    
+      其中R为最大邻居数目
 
 ##### 展望
 
 * 关于merge阶段可以进一步改进（流式读入减小映射表大小），不过边际收益较低（每次更改后验证时间开销大，需要重新构建一遍索引），目前内存压缩已达到可用效果；
-* 关于约5GB内存碎片问题有待进一步验证，目前正进行引入更优内存分配器jemalloc的实验。
+* 关于约5GB内存碎片问题有待进一步验证。
