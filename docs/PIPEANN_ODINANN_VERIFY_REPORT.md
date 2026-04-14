@@ -67,7 +67,7 @@ build/tests/search_disk_index uint8 ${INDEX_PREFIX} 12 32 \
 - `${INDEX_PREFIX}_mem.index.data`
 - `${INDEX_PREFIX}_mem.index.tags`
 
-这些新增的小索引和抽样数据文件合计大约占用 **2.5GB** 磁盘空间。这个开销相对原始 1B 级数据和磁盘索引是可接受的，但在展示和复现实验时需要提前说明。
+这些新增的小索引和抽样数据文件合计大约占用 **2.5GB** 磁盘空间，耗时约10分钟。这个开销相对原始 1B 级数据和磁盘索引是可接受的，但在展示和复现实验时需要提前说明。
 
 ## 4. Recall-QPS 对比图
 
