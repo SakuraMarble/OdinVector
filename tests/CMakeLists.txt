@@ -46,6 +46,9 @@ target_link_libraries(overall_performance ${PROJECT_NAME})
 add_executable(test_insert_search test_insert_search.cpp)
 target_link_libraries(test_insert_search ${PROJECT_NAME})
 
+add_executable(test_insert test_insert.cpp)
+target_link_libraries(test_insert ${PROJECT_NAME})
+
 add_executable(overall_perf_mem overall_perf_mem.cpp)
 target_link_libraries(overall_perf_mem ${PROJECT_NAME})
 

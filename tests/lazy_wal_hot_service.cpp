@@ -13,9 +13,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -29,7 +31,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include "v2/lazy_wal.h"
 #include "utils.h"
 
 namespace {
@@ -73,8 +74,98 @@ std::vector<std::string> split_csv(const std::string &s) {
   return out;
 }
 
-using WalEntry = v2::LazyWalEntry;
-using LazyWal = v2::LazyWal;
+struct WalEntry {
+  // I <tag> <row>
+  // D <tag>
+  // M
+  char op = '\0';
+  uint64_t tag = 0;
+  uint64_t row = 0;
+};
+
+class LazyWal {
+ public:
+  explicit LazyWal(std::string path) : path_(std::move(path)) {}
+
+  const std::string &path() const { return path_; }
+
+  void append_batch(const std::vector<WalEntry> &entries) const {
+    if (entries.empty()) return;
+    int fd = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) {
+      throw std::runtime_error("open wal failed: " + path_ + ", err=" + std::string(std::strerror(errno)));
+    }
+    for (const auto &e : entries) {
+      std::string line;
+      if (e.op == 'I') {
+        line = "I " + std::to_string(e.tag) + " " + std::to_string(e.row) + "\n";
+      } else if (e.op == 'D') {
+        line = "D " + std::to_string(e.tag) + "\n";
+      } else if (e.op == 'M') {
+        line = "M\n";
+      } else {
+        continue;
+      }
+      const char *p = line.data();
+      size_t left = line.size();
+      while (left > 0) {
+        ssize_t n = ::write(fd, p, left);
+        if (n <= 0) {
+          ::close(fd);
+          throw std::runtime_error("write wal failed: " + path_ + ", err=" + std::string(std::strerror(errno)));
+        }
+        p += n;
+        left -= (size_t) n;
+      }
+    }
+    if (::fsync(fd) != 0) {
+      ::close(fd);
+      throw std::runtime_error("fsync wal failed: " + path_ + ", err=" + std::string(std::strerror(errno)));
+    }
+    ::close(fd);
+  }
+
+  void append_merge_marker() const {
+    append_batch(std::vector<WalEntry>{{'M', 0, 0}});
+  }
+
+  void clear() const {
+    int fd = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+      throw std::runtime_error("clear wal failed: " + path_ + ", err=" + std::string(std::strerror(errno)));
+    }
+    (void) ::fsync(fd);
+    ::close(fd);
+  }
+
+  std::vector<WalEntry> load_all() const {
+    std::vector<WalEntry> out;
+    std::ifstream in(path_);
+    if (!in.is_open()) return out;
+    std::string line;
+    while (std::getline(in, line)) {
+      if (line.empty()) continue;
+      std::stringstream ss(line);
+      char op = '\0';
+      ss >> op;
+      if (op == 'I') {
+        uint64_t tag = 0, row = 0;
+        if (!(ss >> tag >> row)) continue;
+        out.push_back(WalEntry{'I', tag, row});
+      } else if (op == 'D') {
+        uint64_t tag = 0;
+        if (!(ss >> tag)) continue;
+        out.push_back(WalEntry{'D', tag, 0});
+      } else if (op == 'M') {
+        out.push_back(WalEntry{'M', 0, 0});
+      }
+    }
+    return out;
+  }
+
+ private:
+  std::string path_;
+};
 
 DataHeader read_header(const std::string &bin) {
   std::ifstream reader(bin, std::ios::binary);
@@ -282,6 +373,12 @@ std::string format_topk(const std::vector<TagT> &tags, const std::vector<float> 
 template<typename T, typename TagT>
 class LazyWalHotService {
  public:
+  struct PendingInsertTask {
+    std::vector<uint64_t> rows;
+    std::vector<TagT> tags;
+    uint32_t use_threads = 1;
+  };
+
   LazyWalHotService(const std::string &index_prefix, const std::string &data_bin, unsigned L_disk, unsigned nthreads,
                     unsigned beamwidth, unsigned nodes_to_cache)
       : data_bin_(data_bin),
@@ -290,6 +387,13 @@ class LazyWalHotService {
         L_disk_(L_disk),
         rng_(get_env_u64("PIPEANN_SERVICE_SEED", 12345ULL)),
         wal_(get_wal_path(index_prefix)) {
+    wal_group_commit_ops_ = std::max<uint64_t>(1, get_env_u64("PIPEANN_LAZY_WAL_GROUP_COMMIT_OPS", 1));
+    wal_group_commit_ms_ = get_env_u64("PIPEANN_LAZY_WAL_GROUP_COMMIT_MS", 0);
+    wal_last_flush_tp_ = std::chrono::steady_clock::now();
+    wal_pending_.reserve((size_t) std::min<uint64_t>(wal_group_commit_ops_, 1ULL << 20));
+    LOG(INFO) << "[WAL] group commit config: ops=" << wal_group_commit_ops_
+              << ", max_delay_ms=" << wal_group_commit_ms_;
+
     const uint64_t expected_insert = get_env_u64("PIPEANN_SERVICE_EXPECTED_INSERT", 0);
     const uint64_t warmup_queries = get_env_u64("PIPEANN_SERVICE_WARMUP_QUERIES", 2000);
     const uint64_t warmup_k = get_env_u64("PIPEANN_SERVICE_WARMUP_K", 10);
@@ -320,6 +424,16 @@ class LazyWalHotService {
     maybe_pre_extend_disk_index(*index_, base + expected_insert);
 
     replay_wal();
+    start_async_worker();
+  }
+
+  ~LazyWalHotService() {
+    try {
+      stop_async_worker();
+      flush_wal_pending(true);
+    } catch (const std::exception &e) {
+      LOG(WARNING) << "flush_wal_pending in destructor failed: " << e.what();
+    }
   }
 
   std::string status() {
@@ -328,6 +442,9 @@ class LazyWalHotService {
     std::ostringstream oss;
     oss << "OK status disk_num_points=" << disk_pts << " next_tag=" << next_tag_.load(std::memory_order_relaxed)
         << " pending_inserted=" << tag_to_row_.size() << " threads=" << nthreads_
+        << " async_pending_points=" << async_pending_points_.load(std::memory_order_relaxed)
+        << " async_enqueued=" << async_enqueued_points_.load(std::memory_order_relaxed)
+        << " async_applied=" << async_applied_points_.load(std::memory_order_relaxed)
         << " wal_path=" << wal_.path();
     return oss.str();
   }
@@ -352,19 +469,12 @@ class LazyWalHotService {
       tags[i] = (TagT) (start_tag + i);
     }
 
-    const auto wal_st = std::chrono::steady_clock::now();
-    {
-      std::lock_guard<std::mutex> g(wal_mu_);
-      std::vector<WalEntry> entries;
-      entries.reserve((size_t) n);
-      for (size_t i = 0; i < (size_t) n; ++i) {
-        entries.push_back(WalEntry{'I', (uint64_t) tags[i], rows[i]});
-      }
-      wal_.append_batch(entries);
+    std::vector<WalEntry> entries;
+    entries.reserve((size_t) n);
+    for (size_t i = 0; i < (size_t) n; ++i) {
+      entries.push_back(WalEntry{'I', (uint64_t) tags[i], rows[i]});
     }
-    const auto wal_ed = std::chrono::steady_clock::now();
-    const double wal_ms =
-        (double) std::chrono::duration_cast<std::chrono::microseconds>(wal_ed - wal_st).count() / 1.0e3;
+    const double wal_ms = append_wal_entries(entries, false);
 
     const auto st = std::chrono::steady_clock::now();
     {
@@ -410,19 +520,12 @@ class LazyWalHotService {
       tags[i] = (TagT) (start_tag + i);
     }
 
-    const auto wal_st = std::chrono::steady_clock::now();
-    {
-      std::lock_guard<std::mutex> g(wal_mu_);
-      std::vector<WalEntry> entries;
-      entries.reserve(rows.size());
-      for (size_t i = 0; i < rows.size(); ++i) {
-        entries.push_back(WalEntry{'I', (uint64_t) tags[i], rows[i]});
-      }
-      wal_.append_batch(entries);
+    std::vector<WalEntry> entries;
+    entries.reserve(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+      entries.push_back(WalEntry{'I', (uint64_t) tags[i], rows[i]});
     }
-    const auto wal_ed = std::chrono::steady_clock::now();
-    const double wal_ms =
-        (double) std::chrono::duration_cast<std::chrono::microseconds>(wal_ed - wal_st).count() / 1.0e3;
+    const double wal_ms = append_wal_entries(entries, false);
 
     const auto st = std::chrono::steady_clock::now();
     {
@@ -450,6 +553,117 @@ class LazyWalHotService {
     return oss.str();
   }
 
+  std::string insert_random_async(uint64_t n, uint32_t use_threads) {
+    if (n == 0) return "ERR n must be > 0";
+    uint64_t start_tag = 0;
+    if (!reserve_tags(n, start_tag)) {
+      return "ERR tag overflow";
+    }
+
+    const auto st = std::chrono::steady_clock::now();
+    std::vector<uint64_t> rows;
+    {
+      std::lock_guard<std::mutex> g(rng_mu_);
+      rows = sample_rows_for_insert(h_.npts, (size_t) n, rng_);
+    }
+    std::vector<TagT> tags((size_t) n);
+    std::vector<WalEntry> entries;
+    entries.reserve((size_t) n);
+    for (size_t i = 0; i < (size_t) n; ++i) {
+      tags[i] = (TagT) (start_tag + i);
+      entries.push_back(WalEntry{'I', (uint64_t) tags[i], rows[i]});
+    }
+    const double wal_ms = append_wal_entries(entries, false);
+    {
+      std::unique_lock<std::shared_mutex> lk(map_mu_);
+      for (size_t i = 0; i < (size_t) n; ++i) {
+        tag_to_row_[tags[i]] = rows[i];
+      }
+    }
+
+    PendingInsertTask task;
+    task.rows = std::move(rows);
+    task.tags = std::move(tags);
+    task.use_threads = use_threads;
+    enqueue_insert_task(std::move(task));
+
+    const auto ed = std::chrono::steady_clock::now();
+    const double sec =
+        (double) std::chrono::duration_cast<std::chrono::microseconds>(ed - st).count() / 1.0e6;
+
+    std::ostringstream oss;
+    oss << "OK insert_random_async n=" << n << " start_tag=" << start_tag
+        << " time_ms=" << (sec * 1000.0)
+        << " avg_us=" << (sec * 1.0e6 / (double) n)
+        << " tps=" << ((sec > 0.0) ? ((double) n / sec) : 0.0)
+        << " threads=" << use_threads
+        << " wal_ms=" << wal_ms
+        << " async_pending_points=" << async_pending_points_.load(std::memory_order_relaxed);
+    return oss.str();
+  }
+
+  std::string insert_rows_async_cmd(const std::vector<uint64_t> &rows, uint32_t use_threads) {
+    if (rows.empty()) return "ERR empty rows";
+    for (auto r : rows) {
+      if (r >= h_.npts) return "ERR row out of range";
+    }
+
+    uint64_t start_tag = 0;
+    if (!reserve_tags(rows.size(), start_tag)) {
+      return "ERR tag overflow";
+    }
+
+    const auto st = std::chrono::steady_clock::now();
+    std::vector<TagT> tags(rows.size());
+    std::vector<WalEntry> entries;
+    entries.reserve(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+      tags[i] = (TagT) (start_tag + i);
+      entries.push_back(WalEntry{'I', (uint64_t) tags[i], rows[i]});
+    }
+    const double wal_ms = append_wal_entries(entries, false);
+    {
+      std::unique_lock<std::shared_mutex> lk(map_mu_);
+      for (size_t i = 0; i < rows.size(); ++i) {
+        tag_to_row_[tags[i]] = rows[i];
+      }
+    }
+    PendingInsertTask task;
+    task.rows = rows;
+    task.tags = std::move(tags);
+    task.use_threads = use_threads;
+    enqueue_insert_task(std::move(task));
+
+    const auto ed = std::chrono::steady_clock::now();
+    const double sec =
+        (double) std::chrono::duration_cast<std::chrono::microseconds>(ed - st).count() / 1.0e6;
+
+    std::ostringstream oss;
+    oss << "OK insert_rows_async n=" << rows.size() << " start_tag=" << start_tag
+        << " time_ms=" << (sec * 1000.0)
+        << " avg_us=" << (sec * 1.0e6 / (double) rows.size())
+        << " tps=" << ((sec > 0.0) ? ((double) rows.size() / sec) : 0.0)
+        << " threads=" << use_threads
+        << " wal_ms=" << wal_ms
+        << " async_pending_points=" << async_pending_points_.load(std::memory_order_relaxed);
+    return oss.str();
+  }
+
+  std::string async_wait(uint64_t timeout_sec) {
+    const auto st = std::chrono::steady_clock::now();
+    const bool ok = wait_async_drain(timeout_sec == 0 ? 0 : timeout_sec * 1000ULL);
+    const auto ed = std::chrono::steady_clock::now();
+    const double ms =
+        (double) std::chrono::duration_cast<std::chrono::microseconds>(ed - st).count() / 1.0e3;
+    std::ostringstream oss;
+    oss << (ok ? "OK" : "ERR") << " async_wait"
+        << " wait_ms=" << ms
+        << " pending_points=" << async_pending_points_.load(std::memory_order_relaxed)
+        << " enqueued=" << async_enqueued_points_.load(std::memory_order_relaxed)
+        << " applied=" << async_applied_points_.load(std::memory_order_relaxed);
+    return oss.str();
+  }
+
   std::string delete_base_random(uint64_t n) {
     if (n == 0) return "ERR n must be > 0";
     std::vector<TagT> tags;
@@ -458,17 +672,10 @@ class LazyWalHotService {
       tags = sample_unique_in_range<TagT>(0, index_->_disk_index->num_points, (size_t) n, rng_);
     }
 
-    const auto wal_st = std::chrono::steady_clock::now();
-    {
-      std::lock_guard<std::mutex> g(wal_mu_);
-      std::vector<WalEntry> entries;
-      entries.reserve((size_t) n);
-      for (auto tg : tags) entries.push_back(WalEntry{'D', (uint64_t) tg, 0});
-      wal_.append_batch(entries);
-    }
-    const auto wal_ed = std::chrono::steady_clock::now();
-    const double wal_ms =
-        (double) std::chrono::duration_cast<std::chrono::microseconds>(wal_ed - wal_st).count() / 1.0e3;
+    std::vector<WalEntry> entries;
+    entries.reserve((size_t) n);
+    for (auto tg : tags) entries.push_back(WalEntry{'D', (uint64_t) tg, 0});
+    const double wal_ms = append_wal_entries(entries, false);
 
     const auto st = std::chrono::steady_clock::now();
     {
@@ -513,17 +720,10 @@ class LazyWalHotService {
       }
     }
 
-    const auto wal_st = std::chrono::steady_clock::now();
-    {
-      std::lock_guard<std::mutex> g(wal_mu_);
-      std::vector<WalEntry> entries;
-      entries.reserve((size_t) n);
-      for (auto tg : pick) entries.push_back(WalEntry{'D', (uint64_t) tg, 0});
-      wal_.append_batch(entries);
-    }
-    const auto wal_ed = std::chrono::steady_clock::now();
-    const double wal_ms =
-        (double) std::chrono::duration_cast<std::chrono::microseconds>(wal_ed - wal_st).count() / 1.0e3;
+    std::vector<WalEntry> entries;
+    entries.reserve((size_t) n);
+    for (auto tg : pick) entries.push_back(WalEntry{'D', (uint64_t) tg, 0});
+    const double wal_ms = append_wal_entries(entries, false);
 
     const auto st = std::chrono::steady_clock::now();
     {
@@ -550,17 +750,10 @@ class LazyWalHotService {
 
   std::string delete_tags_cmd(const std::vector<TagT> &tags) {
     if (tags.empty()) return "ERR empty tags";
-    const auto wal_st = std::chrono::steady_clock::now();
-    {
-      std::lock_guard<std::mutex> g(wal_mu_);
-      std::vector<WalEntry> entries;
-      entries.reserve(tags.size());
-      for (auto tg : tags) entries.push_back(WalEntry{'D', (uint64_t) tg, 0});
-      wal_.append_batch(entries);
-    }
-    const auto wal_ed = std::chrono::steady_clock::now();
-    const double wal_ms =
-        (double) std::chrono::duration_cast<std::chrono::microseconds>(wal_ed - wal_st).count() / 1.0e3;
+    std::vector<WalEntry> entries;
+    entries.reserve(tags.size());
+    for (auto tg : tags) entries.push_back(WalEntry{'D', (uint64_t) tg, 0});
+    const double wal_ms = append_wal_entries(entries, false);
 
     const auto st = std::chrono::steady_clock::now();
     {
@@ -660,6 +853,7 @@ class LazyWalHotService {
 
   std::string merge_now(uint32_t use_threads) {
     pipeann::Timer t;
+    wait_async_drain(0);
     {
       std::unique_lock<std::shared_mutex> lk(state_mu_);
       auto *disk = index_->_disk_index;
@@ -685,8 +879,11 @@ class LazyWalHotService {
     std::string wal_err;
     try {
       std::lock_guard<std::mutex> g(wal_mu_);
+      flush_wal_pending_locked();
       wal_.append_merge_marker();
       wal_.clear();
+      wal_pending_.clear();
+      wal_last_flush_tp_ = std::chrono::steady_clock::now();
     } catch (const std::exception &e) {
       wal_ok = false;
       wal_err = e.what();
@@ -711,6 +908,9 @@ class LazyWalHotService {
     std::ostringstream oss;
     oss << "OK stats inserted=" << ins << " deleted=" << del << " queries=" << q
         << " avg_query_us=" << ((q > 0) ? ((double) qus / (double) q) : 0.0)
+        << " async_pending_points=" << async_pending_points_.load(std::memory_order_relaxed)
+        << " async_enqueued=" << async_enqueued_points_.load(std::memory_order_relaxed)
+        << " async_applied=" << async_applied_points_.load(std::memory_order_relaxed)
         << " replayed_inserts=" << r_ins
         << " replayed_deletes=" << r_del;
     return oss.str();
@@ -730,12 +930,154 @@ class LazyWalHotService {
   std::string wal_info() {
     std::ostringstream oss;
     oss << "OK wal path=" << wal_.path()
+        << " pending_ops=" << wal_pending_ops_.load(std::memory_order_relaxed)
+        << " flushes=" << wal_flush_count_.load(std::memory_order_relaxed)
+        << " async_pending_points=" << async_pending_points_.load(std::memory_order_relaxed)
+        << " group_ops=" << wal_group_commit_ops_
+        << " group_ms=" << wal_group_commit_ms_
         << " replayed_inserts=" << replayed_inserts_.load(std::memory_order_relaxed)
         << " replayed_deletes=" << replayed_deletes_.load(std::memory_order_relaxed);
     return oss.str();
   }
 
+  std::string wal_flush() {
+    const double wal_ms = flush_wal_pending(true);
+    std::ostringstream oss;
+    oss << "OK wal_flush wal_ms=" << wal_ms
+        << " pending_ops=" << wal_pending_ops_.load(std::memory_order_relaxed);
+    return oss.str();
+  }
+
  private:
+  void flush_wal_pending_locked() {
+    if (wal_pending_.empty()) return;
+    wal_.append_batch(wal_pending_);
+    wal_pending_.clear();
+    wal_last_flush_tp_ = std::chrono::steady_clock::now();
+    wal_pending_ops_.store(0, std::memory_order_relaxed);
+    wal_flush_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  double flush_wal_pending(bool force) {
+    const auto st = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> g(wal_mu_);
+    const bool reach_ops = wal_pending_.size() >= wal_group_commit_ops_;
+    bool reach_time = false;
+    if (!wal_pending_.empty() && wal_group_commit_ms_ > 0) {
+      const auto now = std::chrono::steady_clock::now();
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - wal_last_flush_tp_).count();
+      reach_time = ms >= (int64_t) wal_group_commit_ms_;
+    }
+    if (force || reach_ops || reach_time) {
+      flush_wal_pending_locked();
+    }
+    const auto ed = std::chrono::steady_clock::now();
+    return (double) std::chrono::duration_cast<std::chrono::microseconds>(ed - st).count() / 1.0e3;
+  }
+
+  double append_wal_entries(const std::vector<WalEntry> &entries, bool force_flush) {
+    const auto st = std::chrono::steady_clock::now();
+    {
+      std::lock_guard<std::mutex> g(wal_mu_);
+      wal_pending_.insert(wal_pending_.end(), entries.begin(), entries.end());
+      wal_pending_ops_.store((uint64_t) wal_pending_.size(), std::memory_order_relaxed);
+      const bool reach_ops = wal_pending_.size() >= wal_group_commit_ops_;
+      bool reach_time = false;
+      if (!wal_pending_.empty() && wal_group_commit_ms_ > 0) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - wal_last_flush_tp_).count();
+        reach_time = ms >= (int64_t) wal_group_commit_ms_;
+      }
+      if (force_flush || reach_ops || reach_time) {
+        flush_wal_pending_locked();
+      }
+    }
+    const auto ed = std::chrono::steady_clock::now();
+    return (double) std::chrono::duration_cast<std::chrono::microseconds>(ed - st).count() / 1.0e3;
+  }
+
+  void enqueue_insert_task(PendingInsertTask &&task) {
+    const uint64_t n = (uint64_t) task.tags.size();
+    {
+      std::lock_guard<std::mutex> lk(async_mu_);
+      async_queue_.emplace_back(std::move(task));
+    }
+    async_pending_points_.fetch_add(n, std::memory_order_relaxed);
+    async_enqueued_points_.fetch_add(n, std::memory_order_relaxed);
+    async_cv_.notify_one();
+  }
+
+  bool wait_async_drain(uint64_t timeout_ms) {
+    std::unique_lock<std::mutex> lk(async_mu_);
+    auto drained = [this]() {
+      return async_queue_.empty() && async_inflight_points_ == 0;
+    };
+    if (timeout_ms == 0) {
+      async_drain_cv_.wait(lk, drained);
+      return true;
+    }
+    return async_drain_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), drained);
+  }
+
+  void async_insert_worker_loop() {
+    while (true) {
+      PendingInsertTask task;
+      {
+        std::unique_lock<std::mutex> lk(async_mu_);
+        async_cv_.wait(lk, [this]() { return async_stop_ || !async_queue_.empty(); });
+        if (async_stop_ && async_queue_.empty()) {
+          break;
+        }
+        task = std::move(async_queue_.front());
+        async_queue_.pop_front();
+        async_inflight_points_ = task.tags.size();
+      }
+
+      uint64_t n = (uint64_t) task.tags.size();
+      bool ok = true;
+      try {
+        std::vector<T> vecs;
+        read_rows<T>(data_bin_, h_, task.rows, vecs);
+        {
+          std::shared_lock<std::shared_mutex> lk(state_mu_);
+          parallel_insert(vecs, task.tags, task.use_threads);
+        }
+        total_inserted_.fetch_add(n, std::memory_order_relaxed);
+        async_applied_points_.fetch_add(n, std::memory_order_relaxed);
+      } catch (const std::exception &e) {
+        ok = false;
+        LOG(ERROR) << "[AsyncInsert] failed: " << e.what() << ", n=" << n;
+      }
+
+      async_pending_points_.fetch_sub(n, std::memory_order_relaxed);
+      {
+        std::lock_guard<std::mutex> lk(async_mu_);
+        async_inflight_points_ = 0;
+      }
+      async_drain_cv_.notify_all();
+      if (!ok) {
+        // keep going; requests are already accepted and WAL-ed
+      }
+    }
+    async_drain_cv_.notify_all();
+  }
+
+  void start_async_worker() {
+    async_stop_ = false;
+    async_worker_ = std::thread([this]() { async_insert_worker_loop(); });
+  }
+
+  void stop_async_worker() {
+    {
+      std::lock_guard<std::mutex> lk(async_mu_);
+      async_stop_ = true;
+    }
+    async_cv_.notify_all();
+    if (async_worker_.joinable()) {
+      async_worker_.join();
+    }
+  }
+
   void wait_bg_tasks() {
     auto *disk = index_ ? index_->_disk_index : nullptr;
     if (!disk) return;
@@ -851,6 +1193,23 @@ class LazyWalHotService {
   std::mutex wal_mu_;
   std::mt19937_64 rng_;
   LazyWal wal_;
+  uint64_t wal_group_commit_ops_{1};
+  uint64_t wal_group_commit_ms_{0};
+  std::vector<WalEntry> wal_pending_;
+  std::chrono::steady_clock::time_point wal_last_flush_tp_{};
+  std::atomic<uint64_t> wal_pending_ops_{0};
+  std::atomic<uint64_t> wal_flush_count_{0};
+
+  std::mutex async_mu_;
+  std::condition_variable async_cv_;
+  std::condition_variable async_drain_cv_;
+  std::deque<PendingInsertTask> async_queue_;
+  std::thread async_worker_;
+  bool async_stop_{false};
+  size_t async_inflight_points_{0};
+  std::atomic<uint64_t> async_pending_points_{0};
+  std::atomic<uint64_t> async_enqueued_points_{0};
+  std::atomic<uint64_t> async_applied_points_{0};
 
   std::atomic<uint64_t> total_inserted_{0};
   std::atomic<uint64_t> total_deleted_{0};
@@ -872,12 +1231,14 @@ std::string execute_command(LazyWalHotService<T, TagT> &svc, const std::string &
 
   if (cmd == "HELP") {
     return "OK commands: HELP STATUS STATS INSERT_RANDOM n [threads] INSERT_ROWS csv_rows [threads] "
+           "INSERT_RANDOM_ASYNC n [threads] INSERT_ROWS_ASYNC csv_rows [threads] ASYNC_WAIT [timeout_sec] "
            "DELETE_BASE_RANDOM n DELETE_INSERTED n DELETE_TAGS csv_tags SEARCH_ROW row k [L] [beam] "
-           "SEARCH_TAG tag k [L] [beam] SEARCH_RANDOM nq k [L] [beam] WAL_INFO MERGE [threads] QUIT SHUTDOWN";
+           "SEARCH_TAG tag k [L] [beam] SEARCH_RANDOM nq k [L] [beam] WAL_INFO WAL_FLUSH MERGE [threads] QUIT SHUTDOWN";
   }
   if (cmd == "STATUS") return svc.status();
   if (cmd == "STATS") return svc.stats();
   if (cmd == "WAL_INFO") return svc.wal_info();
+  if (cmd == "WAL_FLUSH") return svc.wal_flush();
   if (cmd == "QUIT") return "OK bye";
   if (cmd == "SHUTDOWN") {
     svc.set_shutdown();
@@ -924,6 +1285,57 @@ std::string execute_command(LazyWalHotService<T, TagT> &svc, const std::string &
       th = (uint32_t) t64;
     }
     return svc.insert_rows_cmd(rows, th);
+  }
+
+  if (cmd == "INSERT_RANDOM_ASYNC") {
+    std::string n_s, t_s;
+    ss >> n_s >> t_s;
+    uint64_t n = 0;
+    if (!parse_u64(n_s, n)) return "ERR usage: INSERT_RANDOM_ASYNC n [threads]";
+    uint32_t th = (uint32_t) get_env_u64("PIPEANN_SERVICE_DEFAULT_THREADS", 0);
+    if (th == 0) th = (uint32_t) get_env_u64("OMP_NUM_THREADS", 1);
+    if (!t_s.empty()) {
+      uint64_t t64 = 0;
+      if (!parse_u64(t_s, t64) || t64 == 0 || t64 > std::numeric_limits<uint32_t>::max()) {
+        return "ERR invalid threads";
+      }
+      th = (uint32_t) t64;
+    }
+    return svc.insert_random_async(n, th);
+  }
+
+  if (cmd == "INSERT_ROWS_ASYNC") {
+    std::string csv, t_s;
+    ss >> csv >> t_s;
+    if (csv.empty()) return "ERR usage: INSERT_ROWS_ASYNC row1,row2,... [threads]";
+    auto toks = split_csv(csv);
+    std::vector<uint64_t> rows;
+    rows.reserve(toks.size());
+    for (const auto &tok : toks) {
+      uint64_t r = 0;
+      if (!parse_u64(tok, r)) return "ERR invalid row list";
+      rows.push_back(r);
+    }
+    uint32_t th = (uint32_t) get_env_u64("PIPEANN_SERVICE_DEFAULT_THREADS", 0);
+    if (th == 0) th = (uint32_t) get_env_u64("OMP_NUM_THREADS", 1);
+    if (!t_s.empty()) {
+      uint64_t t64 = 0;
+      if (!parse_u64(t_s, t64) || t64 == 0 || t64 > std::numeric_limits<uint32_t>::max()) {
+        return "ERR invalid threads";
+      }
+      th = (uint32_t) t64;
+    }
+    return svc.insert_rows_async_cmd(rows, th);
+  }
+
+  if (cmd == "ASYNC_WAIT") {
+    std::string timeout_s;
+    ss >> timeout_s;
+    uint64_t timeout_sec = 0;
+    if (!timeout_s.empty()) {
+      if (!parse_u64(timeout_s, timeout_sec)) return "ERR usage: ASYNC_WAIT [timeout_sec]";
+    }
+    return svc.async_wait(timeout_sec);
   }
 
   if (cmd == "DELETE_BASE_RANDOM") {
