@@ -11,8 +11,6 @@
 /src/liburing.so*
 /src/liburing-ffi.a
 /src/liburing-ffi.so*
-/src/include/liburing/compat.h
-/src/include/liburing/io_uring_version.h
 
 /examples/io_uring-close-test
 /examples/io_uring-cp

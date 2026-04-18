@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <set>
+#include <atomic>
 #include "v2/page_cache.h"
 #include <iostream>
 #include <iomanip>
@@ -187,6 +188,11 @@ namespace pipeann {
                        float *res_dists, const _u64 beam_width, QueryStats *stats = nullptr,
                        tsl::robin_set<uint32_t> *deleted_nodes = nullptr, bool dyn_search_l = true);
 
+    size_t filter_beam_search(const T *query, const _u64 k_search, const _u32 mem_L, const _u64 l_search,
+                              TagT *res_tags, float *res_dists, const _u64 beam_width,
+                              const std::vector<uint32_t> &candidate_ids, QueryStats *stats = nullptr,
+                              tsl::robin_set<uint32_t> *deleted_nodes = nullptr, bool dyn_search_l = true);
+
     size_t coro_search(T **queries, const _u64 k_search, const _u32 mem_L, const _u64 l_search, TagT **res_tags,
                        float **res_dists, const _u64 beam_width, int N);
 
@@ -271,6 +277,12 @@ namespace pipeann {
                         std::vector<Neighbor> &expanded_nodes_info, tsl::robin_map<uint32_t, T *> *coord_map = nullptr,
                         QueryStats *stats = nullptr, tsl::robin_set<uint32_t> *exclude_nodes = nullptr,
                         bool dyn_search_l = true, std::vector<uint64_t> *passthrough_page_ref = nullptr);
+    void do_filter_beam_search(const T *vec, uint32_t k_search, uint32_t mem_L, uint32_t Lsize,
+                               const uint32_t beam_width, std::vector<Neighbor> &expanded_nodes_info,
+                               tsl::robin_set<uint32_t> *candidate_set,
+                               tsl::robin_map<uint32_t, T *> *coord_map = nullptr, QueryStats *stats = nullptr,
+                               tsl::robin_set<uint32_t> *exclude_nodes = nullptr, bool dyn_search_l = true,
+                               std::vector<uint64_t> *passthrough_page_ref = nullptr);
     void occlude_list(std::vector<Neighbor> &pool, const tsl::robin_map<uint32_t, T *> &coord_map,
                       std::vector<Neighbor> &result, std::vector<float> &occlude_factor);
     void prune_neighbors(const tsl::robin_map<uint32_t, T *> &coord_map, std::vector<Neighbor> &pool,
@@ -295,6 +307,7 @@ namespace pipeann {
     void delta_prune_neighbors_pq(std::vector<TriangleNeighbor> &pool, std::vector<uint32_t> &pruned_list,
                                   uint8_t *scratch, int tgt_idx);
     void reload(const char *index_prefix, uint32_t num_threads);
+    void flush_page_cache();
     // background I/O commit.
     struct BgTask {
       QueryBuffer<T> *thread_data;
@@ -304,6 +317,7 @@ namespace pipeann {
     };
     // its concurrency should not be the bottleneck.
     ConcurrentQueue<BgTask *> bg_tasks = ConcurrentQueue<BgTask *>(nullptr);
+    std::atomic<uint64_t> bg_tasks_inflight{0};
     void bg_io_thread();
     static constexpr int kBgIOThreads = 1;
     std::thread *bg_io_thread_[kBgIOThreads]{nullptr};
@@ -319,7 +333,7 @@ namespace pipeann {
     // if ID == tag, then it is not stored.
     libcuckoo::cuckoohash_map<uint32_t, TagT> tags;
     TagT id2tag(uint32_t id) {
-#ifdef NO_MAPPING
+#if defined(NO_MAPPING) || defined(TAGS_IDENTITY_ONLY)
       return id;  // use ID to replace tags.
 #else
       TagT ret;
@@ -448,7 +462,7 @@ namespace pipeann {
 
     libcuckoo::cuckoohash_map<uint32_t, uint32_t> id2loc_;  // id -> loc (start from 0)
     uint32_t id2loc(uint32_t id) {
-#ifdef NO_MAPPING
+#if defined(NO_MAPPING) || defined(IDENTITY_MAPPING_ONLY)
       return id;
 #else
       uint32_t loc = 0;
@@ -476,14 +490,24 @@ namespace pipeann {
 
     std::mutex alloc_lock;
     uint32_t loc2id(uint32_t loc) {
+#if defined(NO_MAPPING) || defined(IDENTITY_MAPPING_ONLY)
+      uint64_t cur = cur_id.load(std::memory_order_relaxed);
+      return (loc < cur) ? loc : kInvalidID;
+#else
       uint32_t page = loc_sector_no(loc);
       uint32_t offset = loc % nnodes_per_sector;
       uint32_t id = kInvalidID;
       page_layout.find_fn(page, [&](PageArr &v) { id = v[offset]; });
       return id;  // kInvalidID if fails.
+#endif
     }
 
     void set_loc2id(uint32_t loc, uint32_t id) {
+#if defined(NO_MAPPING) || defined(IDENTITY_MAPPING_ONLY)
+      (void) loc;
+      (void) id;
+      return;
+#else
       uint32_t page = loc_sector_no(loc);
       uint32_t offset = loc % nnodes_per_sector;
       page_layout.upsert(page, [&](PageArr &v, libcuckoo::UpsertContext ctx) {
@@ -494,9 +518,14 @@ namespace pipeann {
         }
         v[offset] = id;
       });
+#endif
     }
 
     void erase_loc2id(uint32_t loc) {
+#if defined(NO_MAPPING) || defined(IDENTITY_MAPPING_ONLY)
+      (void) loc;
+      return;
+#else
       uint32_t page = loc_sector_no(loc);
       uint32_t offset = loc % nnodes_per_sector;
       page_layout.upsert(page, [&](PageArr &v) {
@@ -512,6 +541,7 @@ namespace pipeann {
           empty_pages.push(page);
         }
       });
+#endif
     }
 
     ConcurrentQueue<uint32_t> empty_pages = ConcurrentQueue<uint32_t>(kInvalidID);
@@ -620,6 +650,10 @@ namespace pipeann {
     }
 
     void verify_id2loc() {
+#if defined(NO_MAPPING) || defined(IDENTITY_MAPPING_ONLY)
+      LOG(INFO) << "ID2loc consistency check skipped (identity mapping).";
+      return;
+#endif
       // verify id -> loc -> id map.
       LOG(INFO) << "ID2loc size: " << id2loc_.size() << ", cur_loc: " << cur_loc.load() << ", cur_id: " << cur_id
                 << ", nnodes_per_sector: " << nnodes_per_sector;
@@ -656,6 +690,20 @@ namespace pipeann {
     void merge_deletes(const std::string &in_path_prefix, const std::string &out_path_prefix,
                        const std::vector<TagT> &deleted_nodes, const tsl::robin_set<TagT> &deleted_nodes_set,
                        uint32_t nthreads, const uint32_t &n_sampled_nbrs);
+
+    // Full merge graph rewrite with streaming PQ/tags (no large PQ/tags buffers).
+    void merge_deletes_stream_pq_tags(const std::string &in_path_prefix, const std::string &out_path_prefix,
+                                      const std::vector<TagT> &deleted_nodes,
+                                      const tsl::robin_set<TagT> &deleted_nodes_set, uint32_t nthreads,
+                                      const uint32_t &n_sampled_nbrs);
+
+    // Graph-only rebuild: sequentially scan and re-prune neighbor lists in-place.
+    // Does NOT rebuild PQ or tags.
+    void rebuild_graph_in_place(uint32_t nthreads = 0);
+
+    // Graph-only merge to a new prefix. Rewrites disk graph, copies PQ/tags from input.
+    void merge_graph_only(const std::string &in_path_prefix, const std::string &out_path_prefix,
+                          uint32_t nthreads = 0);
 
     void write_metadata_and_pq(const std::string &in_path_prefix, const std::string &out_path_prefix,
                                const uint64_t &new_npoints, const uint64_t &new_medoid,

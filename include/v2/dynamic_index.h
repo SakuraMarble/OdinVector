@@ -28,11 +28,11 @@ namespace pipeann {
 
     ~DynamicSSDIndex();
 
-    void checkpoint();
+    void checkpoint();// 保存当前索引状态到持久化存储
     v2::Journal<TagT> *journal;
 
     // in-place
-    int insert(const T *point, const TagT &tag);
+    int insert(const T *point, const TagT &tag);// 插入新向量并关联标签
 
     void search(const T *query, const uint64_t K, const uint32_t mem_L, const uint64_t search_L,
                 const uint32_t beam_width, TagT *tags, float *distances, QueryStats *stats, bool dyn_search_l = true);
@@ -41,6 +41,9 @@ namespace pipeann {
 
     void final_merge(const uint32_t &nthreads = 0,
                      const uint32_t &n_sampled_nbrs = std::numeric_limits<uint32_t>::max());
+    void final_merge_graph(const uint32_t &nthreads = 0);
+    void final_merge_stream_pq_tags(const uint32_t &nthreads = 0,
+                                    const uint32_t &n_sampled_nbrs = std::numeric_limits<uint32_t>::max());
 
    private:
     void save_del_set();
@@ -63,7 +66,7 @@ namespace pipeann {
     int active_index = 0;                 // reflects value of writable index
     int active_delete_set = 0;            // reflects active _deletion_set
     std::shared_timed_mutex delete_lock;  // lock to access _deletion_set
-    tsl::robin_set<TagT> deletion_sets[2];
+    tsl::robin_set<TagT> deletion_sets[2];// 两个删除集合（双缓冲）
     std::vector<TagT> deleted_tags[2];
     std::atomic_bool active_del[2];
 

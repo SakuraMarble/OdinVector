@@ -22,11 +22,36 @@
 #include "linux_aligned_file_reader.h"
 
 namespace pipeann {
+  static double get_rss_mb() {
+    std::ifstream f("/proc/self/statm");
+    long t = 0, r = 0;
+    if (f.is_open()) {
+      f >> t >> r;
+    }
+    long page_kb = sysconf(_SC_PAGE_SIZE) / 1024;
+    return (double) r * page_kb / 1024.0;
+  }
 
   template<typename T, typename TagT>
   void SSDIndex<T, TagT>::load_page_layout(const std::string &index_prefix, const _u64 nnodes_per_sector,
                                            const _u64 num_points) {
     std::string partition_file = index_prefix + "_partition.bin.aligned";
+#if defined(NO_MAPPING) || defined(IDENTITY_MAPPING_ONLY)
+    if (std::filesystem::exists(partition_file)) {
+      LOG(ERROR) << "Partition file exists but identity mapping is enabled: " << partition_file;
+      exit(-1);
+    }
+    // Identity mapping: loc == id. Avoid building id2loc_/page_layout to save memory.
+    this->cur_loc = num_points;
+    if (num_points % nnodes_per_sector != 0) {
+      cur_loc += nnodes_per_sector - (num_points % nnodes_per_sector);
+    }
+    LOG(INFO) << "Identity mapping enabled. Skipping page layout build.";
+    LOG(INFO) << "Cur location: " << this->cur_loc;
+    LOG(INFO) << "Page layout loaded.";
+    return;
+#endif
+    LOG(INFO) << "RSS before page layout build: " << get_rss_mb() << " MB";
     if (std::filesystem::exists(partition_file)) {
       LOG(INFO) << "Loading partition file " << partition_file;
       std::ifstream part(partition_file);
@@ -96,6 +121,7 @@ namespace pipeann {
       }
 #endif
     }
+    LOG(INFO) << "RSS after page layout build: " << get_rss_mb() << " MB";
     LOG(INFO) << "Cur location: " << this->cur_loc;
     LOG(INFO) << "Page layout loaded.";
   }

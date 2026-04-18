@@ -3,6 +3,7 @@
 #include <malloc.h>
 
 #include <omp.h>
+#include <fstream>
 #include <cmath>
 #include "liburing/io_uring.h"
 #include "parameters.h"
@@ -11,10 +12,20 @@
 #include "utils.h"
 
 #include <unistd.h>
+#include <cstdlib>
 #include <sys/syscall.h>
 #include "tsl/robin_set.h"
 
 namespace pipeann {
+  static double get_rss_mb() {
+    std::ifstream f("/proc/self/statm");
+    long t = 0, r = 0;
+    if (f.is_open()) {
+      f >> t >> r;
+    }
+    long page_kb = sysconf(_SC_PAGE_SIZE) / 1024;
+    return (double) r * page_kb / 1024.0;
+  }
   template<typename T>
   DiskNode<T>::DiskNode(uint32_t id, T *coords, uint32_t *nhood) : id(id) {
     this->coords = coords;
@@ -222,8 +233,47 @@ namespace pipeann {
     LOG(INFO) << "After single file index check, Tags offset: " << tags_offset
               << " PQ Pivots offset: " << pq_pivots_offset << " PQ Vectors offset: " << pq_vectors_offset;
 
-    size_t npts_u64, nchunks_u64;
-    pipeann::load_bin<_u8>(pq_compressed_vectors, data, npts_u64, nchunks_u64, pq_vectors_offset);
+    size_t npts_u64 = 0, nchunks_u64 = 0;
+    LOG(INFO) << "RSS before PQ load: " << get_rss_mb() << " MB";
+    {
+      std::ifstream pq_reader(pq_compressed_vectors, std::ios::binary);
+      if (!pq_reader.is_open()) {
+        LOG(ERROR) << "Failed to open PQ file: " << pq_compressed_vectors;
+        return -1;
+      }
+      pq_reader.seekg(pq_vectors_offset, pq_reader.beg);
+      int npts_i32 = 0, dim_i32 = 0;
+      pq_reader.read((char *) &npts_i32, sizeof(int));
+      pq_reader.read((char *) &dim_i32, sizeof(int));
+      if (!pq_reader.good()) {
+        LOG(ERROR) << "Failed to read PQ header from: " << pq_compressed_vectors;
+        return -1;
+      }
+      npts_u64 = (unsigned) npts_i32;
+      nchunks_u64 = (unsigned) dim_i32;
+      LOG(INFO) << "Metadata: #pts = " << npts_u64 << ", #dims = " << nchunks_u64 << "...";
+
+      uint64_t reserve_pts = npts_u64;
+      const char *expected_env = std::getenv("PIPEANN_PQ_EXPECTED_POINTS");
+      const char *extra_env = std::getenv("PIPEANN_PQ_EXTRA_POINTS");
+      if (expected_env && expected_env[0] != '\0') {
+        reserve_pts = std::max<uint64_t>(reserve_pts, std::strtoull(expected_env, nullptr, 10));
+      }
+      if (extra_env && extra_env[0] != '\0') {
+        uint64_t extra_pts = std::strtoull(extra_env, nullptr, 10);
+        reserve_pts = std::max<uint64_t>(reserve_pts, npts_u64 + extra_pts);
+      }
+      if (reserve_pts > npts_u64) {
+        LOG(INFO) << "PQ reserve points: " << reserve_pts << " (base " << npts_u64 << ")";
+      }
+      data.resize(reserve_pts * nchunks_u64);
+      pq_reader.read((char *) data.data(), (std::streamsize) (npts_u64 * nchunks_u64 * sizeof(_u8)));
+      if (!pq_reader.good()) {
+        LOG(ERROR) << "Failed to read PQ payload from: " << pq_compressed_vectors;
+        return -1;
+      }
+    }
+    LOG(INFO) << "RSS after PQ load: " << get_rss_mb() << " MB";
     this->num_points = this->init_num_pts = npts_u64;
     this->n_chunks = nchunks_u64;
 
@@ -256,13 +306,17 @@ namespace pipeann {
 
     // load page layout and set cur_loc
     this->use_page_search_ = use_page_search;
+    LOG(INFO) << "RSS before page layout: " << get_rss_mb() << " MB";
     this->load_page_layout(index_prefix, nnodes_per_sector, num_points);
+    LOG(INFO) << "RSS after page layout: " << get_rss_mb() << " MB";
 
     // load tags
     if (this->enable_tags) {
       std::string tag_file = disk_index_file + ".tags";
+      LOG(INFO) << "RSS before tags load: " << get_rss_mb() << " MB";
       LOG(INFO) << "Loading tags from " << tag_file;
       this->load_tags(tag_file);
+      LOG(INFO) << "RSS after tags load: " << get_rss_mb() << " MB";
     }
 
     num_medoids = 1;
@@ -320,6 +374,20 @@ namespace pipeann {
       LOG(INFO) << "Tags file not found. Using equal mapping";
       // Equal mapping are by default eliminated in tags map.
     } else {
+#ifdef TAGS_IDENTITY_ONLY
+      LOG(INFO) << "Tags identity mapping compiled-in. Skipping tag load.";
+      return;
+#endif
+      const char *skip_env = std::getenv("PIPEANN_SKIP_TAGS_LOAD");
+      if (skip_env && skip_env[0] != '\0' && skip_env[0] != '0') {
+        LOG(INFO) << "Skipping tags load due to PIPEANN_SKIP_TAGS_LOAD. Using equal mapping.";
+        return;
+      }
+      const char *identity_env = std::getenv("PIPEANN_TAGS_IDENTITY");
+      if (identity_env && identity_env[0] != '\0' && identity_env[0] != '0') {
+        LOG(INFO) << "Skipping tags load due to PIPEANN_TAGS_IDENTITY. Using equal mapping.";
+        return;
+      }
       LOG(INFO) << "Load tags from existing file: " << tag_file_name;
       pipeann::load_bin<TagT>(tag_file_name, tag_v, tag_num, tag_dim, offset);
       tags.reserve(tag_v.size());
@@ -331,6 +399,30 @@ namespace pipeann {
       }
     }
     LOG(INFO) << "Loaded " << tags.size() << " tags";
+  }
+
+  template<typename T, typename TagT>
+  void SSDIndex<T, TagT>::flush_page_cache() {
+    // Flush user-space page cache to disk to guarantee graph persistence.
+    void *ctx = reader->get_ctx();
+    uint8_t *tmp = nullptr;
+    pipeann::alloc_aligned((void **) &tmp, SECTOR_LEN, SECTOR_LEN);
+
+    {
+      auto lt = v2::cache.cache.lock_table();
+      std::vector<IORequest> writes;
+      writes.reserve(1);
+      for (auto it = lt.begin(); it != lt.end(); ++it) {
+        const uint64_t page_no = it->first;
+        memcpy(tmp, it->second.buf, SECTOR_LEN);
+        writes.clear();
+        writes.emplace_back(page_no * SECTOR_LEN, SECTOR_LEN, tmp, 0, 0);
+        reader->write(writes, ctx);
+      }
+    }
+
+    pipeann::aligned_free((void *) tmp);
+    v2::cache.clear();
   }
 
   template<typename T, typename TagT>

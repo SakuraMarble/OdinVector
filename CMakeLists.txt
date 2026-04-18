@@ -52,13 +52,28 @@ add_definitions(
 include_directories(
 	${PROJECT_SOURCE_DIR}/third_party/liburing/src/include
 )
-link_directories(
-	${PROJECT_SOURCE_DIR}/third_party/liburing/src
-)
+
+set(BUNDLED_LIBURING_A "${PROJECT_SOURCE_DIR}/third_party/liburing/src/liburing.a")
+set(BUNDLED_LIBURING_SO "${PROJECT_SOURCE_DIR}/third_party/liburing/src/liburing.so")
+
+if(EXISTS "${BUNDLED_LIBURING_A}")
+	message(STATUS "Using bundled liburing: ${BUNDLED_LIBURING_A}")
+	link_libraries("${BUNDLED_LIBURING_A}")
+elseif(EXISTS "${BUNDLED_LIBURING_SO}")
+	message(STATUS "Using bundled liburing: ${BUNDLED_LIBURING_SO}")
+	link_libraries("${BUNDLED_LIBURING_SO}")
+else()
+	find_library(SYSTEM_LIBURING uring)
+	if(SYSTEM_LIBURING)
+		message(STATUS "Using system liburing: ${SYSTEM_LIBURING}")
+		link_libraries(${SYSTEM_LIBURING})
+	else()
+		message(FATAL_ERROR "liburing not found. Build bundled liburing (third_party/liburing) or install system liburing-dev.")
+	endif()
+endif()
 
 link_libraries(
 	aio
-	uring
 	jemalloc
 )
 # add_compile_options(-fsanitize=address,undefined -lasan -lubsan)
