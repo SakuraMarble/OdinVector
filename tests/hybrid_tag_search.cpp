@@ -563,7 +563,7 @@ std::string recall_string = "Recall@" + std::to_string(recall_at);
             #pragma omp for schedule(dynamic, 1)
             for (int64_t i = 0; i < (int64_t)query_num; i++) {
                 // if(i != 272) continue;
-                std::cout << "\nProcessing Query " << i << " / " << query_num << std::endl;
+                // std::cout << "\nProcessing Query " << i << " / " << query_num << std::endl;
                 try {
                     roaring::Roaring candidates = parser.parse(query_labels[i]);
                     uint64_t cand_count = candidates.cardinality();
@@ -582,42 +582,109 @@ std::string recall_string = "Recall@" + std::to_string(recall_at);
                                    !max_cand_ivf.compare_exchange_weak(cur_max, cand_count));
                         }
 
-                        uint32_t top_L = std::min((uint64_t)recall_at * ivf_topL_multiplier, cand_count);
+                        // 标签约束点数量检查：当满足标签约束的点数量不足recall_at个时，生成报告并跳过搜索
+                        if (cand_count < recall_at) {
+#pragma omp critical
+                            {
+                                std::cout << "[IVF Path Warning] Query " << i 
+                                          << ": Insufficient tag-constrained vectors (" << cand_count 
+                                          << " < " << recall_at << "). Returning all " << cand_count 
+                                          << " vectors that satisfy tag constraints." << std::endl;
+                            }
+                            
+                            // 返回所有满足标签的向量，不足的部分填充默认值
+                            for (size_t j = 0; j < cand_count; j++) {
+                                result_tags[i * recall_at + j] = cand_ids[j];
+                                result_dists[i * recall_at + j] = 0.0f; // 距离将在后续计算
+                            }
+                            for (size_t j = cand_count; j < recall_at; j++) {
+                                result_tags[i * recall_at + j] = 0;
+                                result_dists[i * recall_at + j] = std::numeric_limits<float>::max();
+                            }
+                            stats[i].total_us = 0;
+                            stats[i].n_ios = 0;
+                        } else {
+                            uint32_t top_L = std::min((uint64_t)recall_at * ivf_topL_multiplier, cand_count);
 
-                        auto q_start = std::chrono::high_resolution_clock::now();
-                        
-                        
-                        ivf_pq_search_with_rerank<T>(
-                            query + (i * query_dim), (uint32_t)query_dim,
-                            cand_ids, index.get(), raw_reader,
-                            top_L, (uint32_t)recall_at,
-                            res_ids, res_d);
-                        
-                        auto q_end = std::chrono::high_resolution_clock::now();
+                            auto q_start = std::chrono::high_resolution_clock::now();
+                            
+                            
+                            ivf_pq_search_with_rerank<T>(
+                                query + (i * query_dim), (uint32_t)query_dim,
+                                cand_ids, index.get(), raw_reader,
+                                top_L, (uint32_t)recall_at,
+                                res_ids, res_d);
+                            
+                            auto q_end = std::chrono::high_resolution_clock::now();
 
-                        for (size_t j = 0; j < recall_at; j++) {
-                            result_tags[i * recall_at + j]  = res_ids[j];
-                            result_dists[i * recall_at + j] = res_d[j];
+                            for (size_t j = 0; j < recall_at; j++) {
+                                result_tags[i * recall_at + j]  = res_ids[j];
+                                result_dists[i * recall_at + j] = res_d[j];
+                            }
+                            stats[i].total_us = std::chrono::duration<double>(q_end - q_start).count() * 1e6;
+                            stats[i].n_ios    = 0;
+
+                            // 打印IVF路径的调试信息
+#pragma omp critical
+                            {
+                                std::cout << "\n[Debug IVF Path] Query ID: " << i << std::endl;
+                                std::cout << "  - Hit Rate: " << hit_rate << " (" << cand_count << " / " << total_num_points << ")" << std::endl;
+                                std::cout << "  - [Retrieved Results] (Rank: ID | Dist | Valid?):" << std::endl;
+                                size_t valid_count = 0;
+                                for (size_t j = 0; j < recall_at; j++) {
+                                    uint32_t res_id = res_ids[j];
+                                    float res_dist = res_d[j];
+                                    bool is_valid = candidates.contains(res_id);
+                                    if (is_valid) valid_count++;
+                                    
+                                    std::cout << "    #" << j << ": " << res_id << " | " << res_dist 
+                                            << " | " << (is_valid ? "YES" : "INVALID!!") << std::endl;
+                                }
+                                std::cout << "  - Total Results: " << valid_count << " / " << recall_at << " (all satisfy tag constraints)" << std::endl;
+                                std::cout << "---------------------------------------------------------" << std::endl;
+                            }
                         }
-                        stats[i].total_us = std::chrono::duration<double>(q_end - q_start).count() * 1e6;
-                        stats[i].n_ios    = 0;
                     } else {
                         // === Graph path: direct filter_beam_search ==
-                        count_graph++;
-                        total_cand_graph += cand_count;
-                        {
-                            uint64_t cur_max = max_cand_graph.load();
-                            while (cand_count > cur_max &&
-                                !max_cand_graph.compare_exchange_weak(cur_max, cand_count));
-                        }
+                        
+                        // 标签约束点数量检查：当满足标签约束的点数量不足recall_at个时，生成报告并跳过图检索
+                        if (cand_count < recall_at) {
+#pragma omp critical
+                            {
+                                std::cout << "[Graph Path Warning] Query " << i 
+                                          << ": Insufficient tag-constrained vectors (" << cand_count 
+                                          << " < " << recall_at << "). Skipping graph search and returning all " 
+                                          << cand_count << " vectors that satisfy tag constraints." << std::endl;
+                            }
+                            
+                            // 返回所有满足标签的向量，不足的部分填充默认值
+                            for (size_t j = 0; j < cand_count; j++) {
+                                result_tags[i * recall_at + j] = cand_ids[j];
+                                result_dists[i * recall_at + j] = 0.0f;
+                            }
+                            for (size_t j = cand_count; j < recall_at; j++) {
+                                result_tags[i * recall_at + j] = 0;
+                                result_dists[i * recall_at + j] = std::numeric_limits<float>::max();
+                            }
+                            stats[i].total_us = 0;
+                            stats[i].n_ios = 0;
+                        } else {
+                            count_graph++;
+                            total_cand_graph += cand_count;
+                            {
+                                uint64_t cur_max = max_cand_graph.load();
+                                while (cand_count > cur_max &&
+                                    !max_cand_graph.compare_exchange_weak(cur_max, cand_count));
+                            }
 
-                        // 调用 filter_beam_search
-                        index->filter_beam_search(
-                            query + (i * query_dim), (uint64_t)recall_at, 
-                            mem_L, L,
-                            result_tags.data()  + i * recall_at,
-                            result_dists.data() + i * recall_at, 
-                            beamwidth, cand_ids, stats + i, nullptr, false);
+                            // 调用 filter_beam_search
+                            index->filter_beam_search(
+                                query + (i * query_dim), (uint64_t)recall_at, 
+                                mem_L, L,
+                                result_tags.data()  + i * recall_at,
+                                result_dists.data() + i * recall_at, 
+                                beamwidth, cand_ids, stats + i, nullptr, false);
+                        }
 
                         // ---------------------------------------------------------
                         // [Debug Information] 增强版：打印结果、GT 距离及标签约束验证
@@ -629,14 +696,17 @@ std::string recall_string = "Recall@" + std::to_string(recall_at);
                             
                             // 1. 打印检索出的 Top-K 详细信息
                             std::cout << "  - [Retrieved Results] (Rank: ID | Dist | Valid?):" << std::endl;
+                            size_t valid_count = 0;
                             for (size_t j = 0; j < recall_at; j++) {
                                 uint32_t res_id = result_tags[i * recall_at + j];
                                 float res_dist = result_dists[i * recall_at + j];
                                 bool is_valid = candidates.contains(res_id);
+                                if (is_valid) valid_count++;
                                 
                                 std::cout << "    #" << j << ": " << res_id << " | " << res_dist 
                                         << " | " << (is_valid ? "YES" : "INVALID!!") << std::endl;
                             }
+                            std::cout << "  - Total Results: " << valid_count << " / " << recall_at << " (all satisfy tag constraints)" << std::endl;
 
                             // 2. 打印 Ground Truth 详细信息（包含距离）
                             if (calc_recall && gt_ids) {

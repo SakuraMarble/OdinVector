@@ -377,7 +377,7 @@ namespace pipeann {
     tsl::robin_set<_u64> visited(4096);
     _u32 best_medoid = medoids[0];
     
-    std::vector<Neighbor> &full_retset = expanded_nodes_info;
+    std::vector<Neighbor> &full_retset = expanded_nodes_info; // 最终返回的结果集合
     full_retset.reserve(10 * l_search);
 
     // [修改点 2]: 引入双堆结构与 Exact 集合
@@ -394,6 +394,64 @@ namespace pipeann {
             heap.push(n);
         }
     };
+
+    // [新增] 在exact_result_heap初始化阶段，立即使用candidate_set中的向量id预先推入符合标签约束的点
+    // 通过此机制，即使后续堆未发生更新，最终仍能保证返回k个满足标签约束的结果
+    // 策略：从candidate_set中取最多k_search个点，批量读取其精确坐标并计算距离
+    {
+        uint32_t num_to_prefill = std::min((uint32_t)candidate_set->size(), k_search);
+        std::vector<uint32_t> prefill_ids;
+        prefill_ids.reserve(num_to_prefill);
+        
+        auto it = candidate_set->begin();
+        for (uint32_t i = 0; i < num_to_prefill && it != candidate_set->end(); ++i, ++it) {
+            prefill_ids.push_back(*it);
+            exact_computed_set.insert(*it); // 标记为已处理，避免后续重复计算
+        }
+        
+        // 批量读取这些点的精确坐标并计算距离
+        size_t processed = 0;
+        while (processed < prefill_ids.size()) {
+            size_t batch_size = std::min((size_t)beam_width, prefill_ids.size() - processed);
+            std::vector<uint32_t> batch_ids(prefill_ids.begin() + processed, prefill_ids.begin() + processed + batch_size);
+            processed += batch_size;
+            
+            std::vector<uint32_t> locked = this->lock_idx(idx_lock_table, kInvalidID, batch_ids, true);
+            std::vector<IORequest> prefill_reqs;
+            std::vector<char*> prefill_sectors(batch_size);
+            
+            for (size_t i = 0; i < batch_size; i++) {
+                uint32_t id = batch_ids[i];
+                uint32_t loc = this->id2loc(id);
+                uint64_t offset = loc_sector_no(loc) * SECTOR_LEN;
+                prefill_sectors[i] = sector_scratch + i * size_per_io;
+                prefill_reqs.emplace_back(IORequest(offset, size_per_io, prefill_sectors[i], u_loc_offset(loc), max_node_len));
+            }
+            
+            reader->read(prefill_reqs, ctx);
+            this->unlock_idx(idx_lock_table, locked);
+            
+            for (size_t i = 0; i < batch_size; i++) {
+                uint32_t id = batch_ids[i];
+                char* sector_buf = prefill_sectors[i];
+                uint32_t loc = this->id2loc(id);
+                char* node_disk_buf = offset_to_loc(sector_buf, loc);
+                T* node_fp_coords = offset_to_node_coords(node_disk_buf);
+                
+                float exact_dist = 0.0f;
+                if (data_buf_idx < MAX_N_CMPS) {
+                    T* node_fp_coords_copy = data_buf + (data_buf_idx * aligned_dim);
+                    data_buf_idx++;
+                    memcpy(node_fp_coords_copy, node_fp_coords, data_dim * sizeof(T));
+                    exact_dist = dist_cmp->compare(query, node_fp_coords_copy, (unsigned)aligned_dim);
+                } else {
+                    exact_dist = dist_cmp->compare(query, node_fp_coords, (unsigned)aligned_dim);
+                }
+                
+                push_to_heap(exact_result_heap, Neighbor(id, exact_dist, true), k_search);
+            }
+        }
+    }
 
     // mbj: 容错系数，PQ候选集收集更多以消除误差 IMPORTANT! 过小会导致过滤条件过于严格，过大则增加不必要的 IO 和计算开销
     uint32_t refine_capacity = std::max((uint32_t)3000, k_search * 1000); 
