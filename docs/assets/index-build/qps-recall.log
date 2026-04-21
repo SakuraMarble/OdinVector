@@ -1,0 +1,52 @@
+Search parameters: #threads: 12,  beamwidth: 4
+[utils.h:221:INFO] Reading bin file /home/mabojing/ODinANN-NEW/data/BIGANN_query.u8bin ...
+[utils.h:191:INFO] Metadata: #pts = 10000, #dims = 128...
+[utils.h:60:INFO]  Stat(/home/mabojing/ODinANN-NEW/data/BIGANN_400M_gt_top1000.bin) returned: 0
+[utils.h:288:INFO] Reading truthset file /home/mabojing/ODinANN-NEW/data/BIGANN_400M_gt_top1000.bin...
+[utils.h:297:INFO] Metadata: #pts = 10000, #dims = 1000...
+[ssd_index.cpp:176:ERROR] Range mismatch: 32 vs 0, setting range to 32
+[ssd_index.cpp:180:INFO] Meta-data: # nodes per sector: 15, max node len (bytes): 260, max node degree: 32, npts: 8, dim: 1 disk_nnodes: 400000000 disk_ndims: 128
+[ssd_index.cpp:202:INFO] Tags offset: 109226672128 PQ Pivots offset: 0 PQ Vectors offset: 0
+[ssd_index.cpp:226:INFO] Size per IO: 4096
+[ssd_index.cpp:233:INFO] After single file index check, Tags offset: 109226672128 PQ Pivots offset: 0 PQ Vectors offset: 0
+[ssd_index.cpp:237:INFO] RSS before PQ load: 233.395 MB
+[ssd_index.cpp:254:INFO] Metadata: #pts = 400000000, #dims = 61...
+[ssd_index.cpp:276:INFO] RSS after PQ load: 23503.2 MB
+[ssd_index.cpp:282:INFO] Load compressed vectors from file: index/R32_L32_B6_M200/bigann_1B_R32_L32_B6_M200_merge3_pq_compressed.bin offset: 0 num points: 400000000 n_chunks: 61
+[utils.h:191:INFO] Metadata: #pts = 5, #dims = 1...
+[utils.h:191:INFO] Metadata: #pts = 256, #dims = 128...
+[utils.h:191:INFO] Metadata: #pts = 128, #dims = 1...
+[utils.h:191:INFO] Metadata: #pts = 128, #dims = 1...
+[utils.h:191:INFO] Metadata: #pts = 62, #dims = 1...
+[pq_table.h:94:INFO] Loaded PQ Pivots: #ctrs: 256, #dims: 128, #chunks: 61
+[pq_table.h:134:INFO] Finished optimizing for PQ-PQ distance compuation
+[ssd_index.cpp:297:INFO] Loaded PQ centroids and in-memory compressed vectors. #points: 400000000 #dim: 128 #aligned_dim: 128 #chunks: 61
+[ssd_index.cpp:91:INFO] Init buffers for 12 threads, setup 24 buffers.
+[ssd_index.cpp:107:INFO] Setup 1 background I/O threads for insert...
+[ssd_index.cpp:309:INFO] RSS before page layout: 23714.7 MB
+[page_search.cpp:54:INFO] RSS before page layout build: 23715 MB
+[page_search.cpp:95:INFO] index/R32_L32_B6_M200/bigann_1B_R32_L32_B6_M200_merge3_partition.bin.aligned does not exist, use equal partition mapping
+[page_search.cpp:124:INFO] RSS after page layout build: 31127.8 MB
+[page_search.cpp:125:INFO] Cur location: 400000005
+[page_search.cpp:126:INFO] Page layout loaded.
+[ssd_index.cpp:311:INFO] RSS after page layout: 31127.8 MB
+[ssd_index.cpp:316:INFO] RSS before tags load: 31127.8 MB
+[ssd_index.cpp:317:INFO] Loading tags from index/R32_L32_B6_M200/bigann_1B_R32_L32_B6_M200_merge3_disk.index.tags
+[utils.h:60:INFO]  Stat(index/R32_L32_B6_M200/bigann_1B_R32_L32_B6_M200_merge3_disk.index.tags) returned: 0
+[ssd_index.cpp:391:INFO] Load tags from existing file: index/R32_L32_B6_M200/bigann_1B_R32_L32_B6_M200_merge3_disk.index.tags
+[utils.h:236:INFO] Reading bin file index/R32_L32_B6_M200/bigann_1B_R32_L32_B6_M200_merge3_disk.index.tags ...
+[utils.h:208:INFO] Metadata: #pts = 400000000, #dims = 1...
+[ssd_index.cpp:401:INFO] Loaded 400000000 tags
+[ssd_index.cpp:319:INFO] RSS after tags load: 36251.8 MB
+[ssd_index.cpp:325:INFO] SSDIndex loaded successfully.
+     L   I/O Width         QPS  AvgLat(us)     P99 Lat   Mean Hops    Mean IOs   Recall@10
+=========================================================================================
+    10           4     3528.41     3369.52    11587.00       14.40       50.10       54.86
+    20           4     3834.74     3104.52     6222.00       16.83       60.22       67.84
+    40           4     2839.01     4197.73    12991.00       21.37       78.72       78.00
+    80           4     1879.78     6350.59    13394.00       30.72      116.58       86.17
+   100           4     1452.61     8213.05    25248.00       35.52      135.89       88.39
+   200           4     1099.23    10877.30    29392.00       59.88      233.76       93.61
+   400           4      575.16    20816.67    68616.00      109.35      431.97       96.76
+[ssd_index.cpp:75:INFO] Lock table size: 0
+[ssd_index.cpp:76:INFO] Page cache size: 0
